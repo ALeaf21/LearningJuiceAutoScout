@@ -7,7 +7,10 @@ This repository mixes Python tracking code, browser-based tooling, and documenta
 ## Repository Areas
 
 - `auto_scout.py`
-  Main tracker CLI, exports, logging, and shot detection.
+  Top-level runnable entrypoint and orchestration layer.
+- `autoscout/`
+  Main tracker package.
+  `tracker.py` holds robot tracking, `shot.py` handles shot detection, `runtime.py` owns console/progress behavior, `geometry.py` and `models.py` hold shared primitives, `helpers.py` contains field/manual/debug helpers, and `wpilog.py` writes WPILOG output.
 - `util/juice_log.py`
   Shared JUICE LOG schema implementation for compact pose/shot logs.
 - `tools/calibrate.py`
@@ -51,7 +54,7 @@ Run the validation that matches your change.
 For Python changes, at minimum:
 
 ```bash
-python3 -m py_compile auto_scout.py util/juice_log.py tools/calibrate.py tools/debug.py
+python3 -m py_compile auto_scout.py autoscout/*.py util/juice_log.py tools/calibrate.py tools/debug.py
 ```
 
 If your change affects tracking, calibration, or exports, also do a realistic manual check when possible:

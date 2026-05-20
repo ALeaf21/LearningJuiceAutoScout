@@ -11,7 +11,8 @@ This repository tracks the four robots in an FTC match video, projects them into
 
 The repo currently contains several user-facing tools:
 
-- `auto_scout.py`: main automatic tracker.
+- `auto_scout.py`: runnable automatic-tracker entrypoint.
+- `autoscout/`: internal Python package used by the tracker entrypoint.
 - `util/juice_log.py`: shared Python reader/writer for the compact `robot_positions.jlog` format.
 - `tools/calibrate.py`: interactive corner picker that produces `field_corners.json`.
 - `util/jlog.js`: shared browser-side JLOG encoder/decoder.
@@ -22,7 +23,9 @@ The repo currently contains several user-facing tools:
 
 ## Repository Layout
 
-- `auto_scout.py`: full tracking pipeline, exports, and CLI.
+- `auto_scout.py`: runnable tracker entrypoint, exports, and CLI.
+- `autoscout/`: tracker implementation package.
+  Includes `tracker.py`, `shot.py`, `runtime.py`, `geometry.py`, `models.py`, `helpers.py`, and `wpilog.py`.
 - `util/`: shared cross-tool helpers.
   Includes `juice_log.py` and `jlog.js`.
 - `tools/`: helper scripts and no-build browser tools.
@@ -155,6 +158,25 @@ python3 auto_scout.py \
 This uses the manual labels to build per-robot appearance histograms that help identity assignment.
 
 ## `auto_scout.py`
+
+`auto_scout.py` remains the command you run, but it is now intentionally thin. It mainly:
+
+- parses CLI arguments
+- initializes runtime helpers such as terminal output/progress handling
+- wires together the tracker, shot detector, field detector, and exporters
+- runs `process_match()` as the orchestration loop
+
+Most implementation details now live in `autoscout/`.
+
+### `autoscout/` package layout
+
+- `autoscout/tracker.py`: `RobotTracker`, foreground segmentation, blob extraction, assignment, merge handling, and track-state updates.
+- `autoscout/shot.py`: `ShotDetector`, ball-track association, goal opening detection, and shot resolution.
+- `autoscout/helpers.py`: `FieldDetector`, manual re-ID loading, homography helper functions, and debug-wireframe helpers.
+- `autoscout/runtime.py`: styled terminal printing, progress-bar coordination, and lazy dependency loading.
+- `autoscout/geometry.py`: field coordinate conversion helpers and angle normalization.
+- `autoscout/models.py`: shared dataclasses such as `RobotPose`, `MergeGroup`, `ShotEvent`, and `BallTrack`.
+- `autoscout/wpilog.py`: low-level WPILOG writer.
 
 ## CLI
 
@@ -349,7 +371,7 @@ Internally, those field coordinates still use the legacy corner-origin plane:
 
 The center-origin public coordinates are derived afterward by subtracting `(72, 72)`.
 
-If no corners are supplied, `FieldDetector.detect_field()` tries to find a large quadrilateral automatically using:
+If no corners are supplied, `FieldDetector.detect_field()` in `autoscout/helpers.py` tries to find a large quadrilateral automatically using:
 
 - grayscale conversion
 - Gaussian blur
@@ -361,7 +383,7 @@ This is a fallback, not the preferred workflow.
 
 ### 3. Background model
 
-`RobotTracker.setup()` builds a static background image by sampling `N_BG_SAMPLES = 80` frames uniformly across the whole video and taking the per-pixel median.
+`RobotTracker.setup()` in `autoscout/tracker.py` builds a static background image by sampling `N_BG_SAMPLES = 80` frames uniformly across the whole video and taking the per-pixel median.
 
 Why median:
 

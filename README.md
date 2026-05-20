@@ -8,7 +8,7 @@
 *This project is developed by **Ray Enterprises' R&D** (ARED) for use by FTC Team Juice 16236.*
 
 ## About AutoScout
-`auto_scout.py` tracks the four robots in an FTC match video, projects them into field coordinates, and exports the result for later analysis.
+`auto_scout.py` is the tracker entrypoint for FTC match videos. It orchestrates the tracking pipeline, projects robots into field coordinates, and exports the result for later analysis.
 
 Current outputs are focused on robot motion:
 - `robot_positions.csv` for per-timestamp robot poses and visibility
@@ -85,7 +85,10 @@ That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--co
 ## Repository Layout
 
 - `auto_scout.py`
-  Main tracker CLI and export pipeline.
+  Thin entrypoint that wires together the tracker pipeline, exports, and CLI.
+- `autoscout/`
+  Main Python package for the tracker internals.
+  Includes `tracker.py`, `shot.py`, `runtime.py`, `geometry.py`, `models.py`, `helpers.py`, and `wpilog.py`.
 - `util/`
   Shared helpers including `juice_log.py` and `jlog.js` for the compact `robot_positions.jlog` format.
 - `tools/`
