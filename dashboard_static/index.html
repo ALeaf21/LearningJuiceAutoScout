@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Juice AutoScout Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo">
+          <img src="https://juicerobotics.org/assets/dark/logo.png" alt="Project REDACTED">
+        </div>
+        <div>
+          <div class="brand-name">Juice AutoScout Dashboard</div>
+          <div class="brand-subtitle" id="brandSubtitle">Select an event to start the agent workspace.</div>
+        </div>
+      </div>
+
+      <nav class="nav hidden" id="mainNav">
+        <button type="button" class="nav-btn" data-route="overview">Overview</button>
+        <button type="button" class="nav-btn" data-route="calibration">Calibration</button>
+        <button type="button" class="nav-btn" data-route="settings">Settings</button>
+      </nav>
+
+      <div class="topbar-status">
+        <div class="status-chip">
+          <span>Dashboard</span>
+          <strong id="healthLabel">Starting...</strong>
+        </div>
+        <div class="status-chip hidden" id="progressNudge">
+          <div class="nudge-bar">
+            <span class="seg processed" id="nudgeProcessed"></span>
+            <span class="seg processing" id="nudgeProcessing"></span>
+            <span class="seg queued" id="nudgeQueued"></span>
+            <span class="seg upcoming" id="nudgeUpcoming"></span>
+          </div>
+          <div class="nudge-label" id="nudgeLabel">0 processed / 0 processing / 0 queued / 0 upcoming</div>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section id="selectView" class="view active center-view">
+        <article class="hero-card">
+          <p class="hero-kicker">Event Agent</p>
+          <h1>Load an FTC event</h1>
+          <p class="hero-copy">
+            Enter the season and event code. The dashboard will build the FTC Events URL, scrape the qualification listings,
+            discover available match clips, and open the full event workspace when it finishes.
+          </p>
+          <form id="eventForm" class="event-form">
+            <label>
+              FTC season
+              <input id="seasonInput" type="number" min="2023" max="2099" step="1">
+            </label>
+            <label>
+              Event code / ID
+              <input id="eventCodeInput" type="text" placeholder="FTCCMP1EDIS">
+            </label>
+            <label class="wide">
+              Resolved URL
+              <input id="resolvedUrlInput" type="text" readonly>
+            </label>
+            <div class="hero-actions">
+              <button type="submit" class="primary" id="loadEventButton">
+                <span id="loadEventButtonLabel">Load Event</span>
+              </button>
+            </div>
+          </form>
+          <div class="loading-shell hidden" id="eventLoadingShell">
+            <div class="spinner" aria-hidden="true"></div>
+            <div class="loading-copy">
+              <div id="eventLoadingTitle">Loading event</div>
+              <div id="eventLoadingDetail">Scraping qualification matches and looking for clip links...</div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-indeterminate"></div>
+            </div>
+          </div>
+          <div class="hero-note" id="selectStatus">
+            Example: `FTCCMP1EDIS` resolves to `https://ftc-events.firstinspires.org/2025/FTCCMP1EDIS/qualifications`.
+          </div>
+        </article>
+      </section>
+
+      <section id="overviewView" class="view">
+        <div class="dashboard-grid">
+          <article class="panel match-panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Qualification Matches</div>
+                <h2 id="eventTitle">Event Overview</h2>
+              </div>
+              <button type="button" id="reloadEventButton">Reload Event</button>
+            </div>
+            <div class="match-list scroll-list" id="matchList"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Status Summary</div>
+                <h2>Processing mix</h2>
+              </div>
+            </div>
+            <div class="pie-grid">
+              <div class="donut-wrap" id="statusDonut"></div>
+              <div class="legend-list" id="statusLegend"></div>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Machine Usage</div>
+                <h2>Live hardware snapshot</h2>
+              </div>
+              <button type="button" id="refreshUsageButton">Refresh</button>
+            </div>
+            <div class="usage-grid" id="usageGrid"></div>
+          </article>
+
+          <article class="panel panel-wide">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Agents</div>
+                <h2>Current task assignments</h2>
+              </div>
+            </div>
+            <div class="agent-grid" id="agentGrid"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="processView" class="view">
+        <div class="process-grid">
+          <article class="panel process-main">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Process View</div>
+                <h2 id="processTitle">Select a match</h2>
+                <div class="process-title-meta hidden" id="processTitleMeta"></div>
+              </div>
+              <div class="inline-actions">
+                <button type="button" id="processStartButton" class="primary">Start Processing</button>
+                <button type="button" id="processBackButton">Back To Overview</button>
+              </div>
+            </div>
+            <div class="preview-shell" id="processPreviewShell">
+              <div class="empty-state">No preview available yet. Start processing with debug frames enabled.</div>
+            </div>
+            <div class="process-notice hidden" id="processAuthNotice"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Stats</div>
+                <h2>Job details</h2>
+              </div>
+            </div>
+            <div class="stats-grid" id="processStats"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Checklist</div>
+                <h2>Pipeline progress</h2>
+              </div>
+            </div>
+            <div class="process-checklist" id="processChecklist"></div>
+          </article>
+
+          <article class="panel panel-wide">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Terminal</div>
+                <h2>Live process output</h2>
+              </div>
+              <div class="inline-actions">
+                <button type="button" id="copyProcessLogsButton">Copy Output</button>
+              </div>
+            </div>
+            <pre class="log-block" id="processLogs">No process output yet.</pre>
+          </article>
+
+          <article class="panel panel-wide">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Visualizer</div>
+                <h2>Integrated match data view</h2>
+              </div>
+            </div>
+            <div class="visualizer-shell" id="processVisualizerShell">
+              <div class="empty-state">The data visualizer will appear here after a match finishes and exports robot position data.</div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="calibrationView" class="view">
+        <div class="dashboard-grid">
+          <article class="panel panel-wide">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Calibration</div>
+                <h2>Choose a loaded match video and place the field corners</h2>
+              </div>
+            </div>
+            <div class="form-grid calibration-top">
+              <label>
+                Loaded system video
+                <select id="calibrationVideoSelect"></select>
+              </label>
+              <label>
+                Or upload a local file
+                <input id="calibrationVideoInput" type="file" accept="video/*">
+              </label>
+              <label>
+                Frame position
+                <input id="frameSliderInput" type="range" min="0" max="1000" value="0" disabled>
+              </label>
+              <label>
+                Save filename
+                <input id="cornersFilenameInput" type="text" value="field_corners.json">
+              </label>
+            </div>
+            <div class="inline-actions calibration-actions">
+              <button id="downloadCornersButton" type="button">Download JSON</button>
+              <button id="saveCornersButton" type="button" class="primary">Save In Repo</button>
+            </div>
+            <p id="calibrationStatus" class="helper-copy">
+              Pick a loaded match video, a queued YouTube match clip, or upload a local file. Then scrub to a clean frame and drag the four corners in TL, TR, BR, BL order.
+            </p>
+            <div class="calibration-layout">
+              <div class="stage-card">
+                <canvas id="calibrationCanvas"></canvas>
+                <video id="calibrationVideo" class="calibration-video-buffer" playsinline muted></video>
+              </div>
+              <div class="side-card">
+                <div class="section-title">Corner JSON Preview</div>
+                <pre class="log-block" id="cornersPreview">{
+  "corners_px": []
+}</pre>
+                <a class="tool-link" href="/tools/manual_tracker.html" target="_blank" rel="noreferrer">Open manual tracker in a new tab</a>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="settingsView" class="view">
+        <div class="dashboard-grid">
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Optimization</div>
+                <h2>Dashboard defaults</h2>
+              </div>
+            </div>
+            <form id="settingsForm" class="form-grid">
+              <label>
+                Scrape workers override
+                <input id="settingScrapeWorkers" type="number" min="1" max="32" step="1" placeholder="Auto">
+              </label>
+              <label>
+                Parallel track jobs override
+                <input id="settingParallelJobs" type="number" min="1" max="16" step="1" placeholder="Auto">
+              </label>
+              <label>
+                Output root
+                <input id="settingOutputRoot" type="text" value="./output_dashboard">
+              </label>
+              <label>
+                Default debug cadence
+                <input id="settingDebugEvery" type="number" min="1" step="1" value="1">
+              </label>
+              <label class="wide">
+                yt-dlp cookies.txt path
+                <input id="settingYtdlpCookiesPath" type="text" placeholder="/Users/you/Downloads/cookies.txt">
+              </label>
+              <label class="wide">
+                yt-dlp extractor args override
+                <input id="settingYtdlpExtractorArgs" type="text" placeholder="youtube:player_client=default,mweb;po_token=mweb+...">
+              </label>
+              <label class="checkbox">
+                <input id="settingDebugFrames" type="checkbox">
+                Enable debug frames by default
+              </label>
+              <label class="checkbox">
+                <input id="settingDebugVideo" type="checkbox">
+                Enable debug video by default
+              </label>
+              <label class="checkbox">
+                <input id="settingAutoOpen" type="checkbox">
+                Auto-open process view after starting a job
+              </label>
+              <div class="inline-actions">
+                <button type="submit" class="primary">Save Settings</button>
+              </div>
+            </form>
+            <div class="helper-copy" id="settingsStatus">Hardware recommendations will appear alongside these settings. A cookies file path here is applied to future yt-dlp jobs and YouTube preview resolution.</div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <div class="section-title">Hardware Recommendations</div>
+                <h2>Suggested values from this machine</h2>
+              </div>
+            </div>
+            <div id="settingsHardware" class="stats-grid"></div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

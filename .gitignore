@@ -1,5 +1,8 @@
 output
+output_dashboard
 .pycache
+__pycache__
+*/__pycache__
 AUTOSCOUT_PAPER.tex
 field_corners.json
 changelog.py

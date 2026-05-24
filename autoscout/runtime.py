@@ -145,7 +145,7 @@ def _require(package, pip_name=None):
         return importlib.import_module(package)
     except ImportError:
         name = pip_name or package
-        print("[ERROR] Missing: {}\n  Install: pip install {}".format(name, name))
+        print("[ERROR] Missing: {}\n  Install: python3 -m pip install {}".format(name, name))
         sys.exit(1)
 
 

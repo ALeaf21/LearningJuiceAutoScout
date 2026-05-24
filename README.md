@@ -37,11 +37,17 @@ Output coordinates now use a center-origin field frame:
 Install the runtime dependencies:
 
 ```bash
-pip install opencv-python numpy progress
-pip install scipy
+python3 -m pip install opencv-python numpy progress
+python3 -m pip install scipy
 ```
 
 `scipy` is technically optional, but the tracker uses it for the best blob-to-track assignment.
+
+If you upgraded Python, reinstall optional tools like `yt-dlp` into the same interpreter you use to launch AutoScout:
+
+```bash
+python3 -m pip install -U yt-dlp
+```
 
 ## Quickstart
 Track a local video:
@@ -55,6 +61,22 @@ Track from YouTube:
 ```bash
 python3 auto_scout.py "https://www.youtube.com/watch?v=..."
 ```
+
+Start the local dashboard:
+
+```bash
+python3 dashboard_server.py
+```
+
+Then open `http://127.0.0.1:8765/` in a browser.
+
+The dashboard adds:
+
+- an FTC Events event agent that accepts a season plus event code, or a full FTC Events URL
+- heuristic scraping for match pages and attached YouTube links
+- local hardware inspection with concurrency recommendations
+- background tracker-job launching for the existing CLI
+- an in-browser field-corner calibration tool that exports `field_corners.json`
 
 ## CLI Flags
 | Flag | Type | Default | Description |
@@ -86,9 +108,13 @@ That produces a `field_corners.json` file. Pass it to `auto_scout.py` with `--co
 
 - `auto_scout.py`
   Thin entrypoint that wires together the tracker pipeline, exports, and CLI.
+- `dashboard_server.py`
+  Starts the local dashboard web server.
 - `autoscout/`
   Main Python package for the tracker internals.
-  Includes `tracker.py`, `shot.py`, `runtime.py`, `geometry.py`, `models.py`, `helpers.py`, and `wpilog.py`.
+  Includes `tracker.py`, `shot.py`, `runtime.py`, `geometry.py`, `models.py`, `helpers.py`, `wpilog.py`, `ftc_events.py`, `hardware.py`, and `dashboard_server.py`.
+- `dashboard_static/`
+  No-build dashboard front-end files served by `dashboard_server.py`.
 - `util/`
   Shared helpers including `juice_log.py` and `jlog.js` for the compact `robot_positions.jlog` format.
 - `tools/`

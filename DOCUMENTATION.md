@@ -1,3 +1,4 @@
+![Project Header Image](assets/Project-REDACTED-Header.png)
 # JuiceAutoScout Documentation
 
 ## Overview
@@ -12,6 +13,7 @@ This repository tracks the four robots in an FTC match video, projects them into
 The repo currently contains several user-facing tools:
 
 - `auto_scout.py`: runnable automatic-tracker entrypoint.
+- `dashboard_server.py`: local web dashboard launcher.
 - `autoscout/`: internal Python package used by the tracker entrypoint.
 - `util/juice_log.py`: shared Python reader/writer for the compact `robot_positions.jlog` format.
 - `tools/calibrate.py`: interactive corner picker that produces `field_corners.json`.
@@ -24,8 +26,10 @@ The repo currently contains several user-facing tools:
 ## Repository Layout
 
 - `auto_scout.py`: runnable tracker entrypoint, exports, and CLI.
+- `dashboard_server.py`: starts the local dashboard server.
 - `autoscout/`: tracker implementation package.
-  Includes `tracker.py`, `shot.py`, `runtime.py`, `geometry.py`, `models.py`, `helpers.py`, and `wpilog.py`.
+  Includes `tracker.py`, `shot.py`, `runtime.py`, `geometry.py`, `models.py`, `helpers.py`, `wpilog.py`, `ftc_events.py`, `hardware.py`, and `dashboard_server.py`.
+- `dashboard_static/`: no-build dashboard front-end assets served locally by the Python dashboard server.
 - `util/`: shared cross-tool helpers.
   Includes `juice_log.py` and `jlog.js`.
 - `tools/`: helper scripts and no-build browser tools.
@@ -45,13 +49,13 @@ The repo currently contains several user-facing tools:
 Required in practice:
 
 ```bash
-pip install opencv-python numpy
+python3 -m pip install opencv-python numpy
 ```
 
 Recommended:
 
 ```bash
-pip install scipy progress
+python3 -m pip install scipy progress
 ```
 
 What each dependency is used for:
@@ -157,6 +161,33 @@ python3 auto_scout.py \
 
 This uses the manual labels to build per-robot appearance histograms that help identity assignment.
 
+### Workflow 5: Use the local dashboard
+
+Start the dashboard:
+
+```bash
+python3 dashboard_server.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8765/
+```
+
+The dashboard combines several workflows in one place:
+
+1. Scrape an FTC Events page by entering a season and event code, or a full FTC Events URL.
+2. Review discovered match pages and any YouTube links the scraper can infer.
+3. Inspect the local machine profile and recommended concurrency values.
+4. Launch tracker jobs that call the existing `auto_scout.py` CLI in the background.
+5. Generate `field_corners.json` directly in the browser from a local video frame.
+
+Example FTC Events reference:
+
+- 2025 season event `FTCCMP1EDIS`
+- example URL: `https://ftc-events.firstinspires.org/2025/FTCCMP1EDIS/qualifications`
+
 ## `auto_scout.py`
 
 `auto_scout.py` remains the command you run, but it is now intentionally thin. It mainly:
@@ -177,6 +208,81 @@ Most implementation details now live in `autoscout/`.
 - `autoscout/geometry.py`: field coordinate conversion helpers and angle normalization.
 - `autoscout/models.py`: shared dataclasses such as `RobotPose`, `MergeGroup`, `ShotEvent`, and `BallTrack`.
 - `autoscout/wpilog.py`: low-level WPILOG writer.
+
+## `dashboard_server.py`
+
+`dashboard_server.py` is a local-only web interface layered on top of the existing CLI workflow.
+
+### Purpose
+
+It provides a browser dashboard for:
+
+- FTC Events discovery
+- heuristic YouTube-link scraping
+- machine diagnostics and concurrency suggestions
+- background tracker-job launching
+- browser-based corner calibration
+
+### Launch
+
+```bash
+python3 dashboard_server.py [--host 127.0.0.1] [--port 8765]
+```
+
+### Backend architecture
+
+The implementation is split across:
+
+- `dashboard_server.py`: small root launcher script.
+- `autoscout/dashboard_server.py`: HTTP server, API routes, background job manager, and static-file serving.
+- `autoscout/ftc_events.py`: FTC Events scraping and match-page video discovery.
+- `autoscout/hardware.py`: CPU, memory, GPU, and concurrency recommendation logic.
+- `dashboard_static/`: dashboard HTML, CSS, and browser JavaScript.
+
+### API surface
+
+Current dashboard endpoints include:
+
+- `GET /api/health`: basic liveness check.
+- `GET /api/hardware`: current hardware profile and recommendations.
+- `GET /api/hardware/refresh`: recompute the hardware profile.
+- `GET /api/examples`: local example videos and default corners path.
+- `POST /api/event/discover`: scrape an FTC Events event by season/code or full URL.
+- `POST /api/jobs/start-track`: launch a background `auto_scout.py` process.
+- `GET /api/jobs`: list running and completed jobs.
+- `GET /api/jobs/<job_id>`: inspect one job.
+- `POST /api/save-corners`: write browser-calibrated corners JSON into the repo workspace.
+
+### FTC Events scraping behavior
+
+The event agent is heuristic-based.
+
+- It first loads known event phase pages such as `qualifications` and `playoffs`.
+- It extracts match-looking links from those pages.
+- It follows match pages in parallel and looks for direct YouTube links, YouTube embed URLs, or other obvious external video/watch URLs.
+- If a direct clip is not discoverable, it still returns the match page URL so the operator can inspect it manually.
+
+This is intentionally best-effort rather than API-perfect because public FTC Events pages do not expose a stable, uniform direct-video field in the schedule HTML.
+
+### Hardware recommendations
+
+The dashboard does not rewrite tracker internals at runtime, but it does compute practical recommendations for the local machine:
+
+- suggested FTC Events scrape worker count
+- suggested number of concurrent full tracker jobs
+- suggested `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, and `MKL_NUM_THREADS` per job
+
+These values are used as guidance for the dashboard agent and as defaults when it launches background tracker processes.
+
+### Browser calibration tool
+
+The calibration panel inside the dashboard:
+
+- loads a local video directly in the browser
+- lets the user scrub to a representative frame
+- allows draggable `TL`, `TR`, `BR`, and `BL` corner markers
+- exports JSON in the same `{"corners_px": [[bl], [br], [tr], [tl]]}` format the CLI expects
+- can optionally save that JSON into the repo workspace through `POST /api/save-corners`
 
 ## CLI
 

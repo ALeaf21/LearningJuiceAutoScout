@@ -8,9 +8,13 @@ This repository mixes Python tracking code, browser-based tooling, and documenta
 
 - `auto_scout.py`
   Top-level runnable entrypoint and orchestration layer.
+- `dashboard_server.py`
+  Root launcher for the local dashboard web server.
 - `autoscout/`
   Main tracker package.
-  `tracker.py` holds robot tracking, `shot.py` handles shot detection, `runtime.py` owns console/progress behavior, `geometry.py` and `models.py` hold shared primitives, `helpers.py` contains field/manual/debug helpers, and `wpilog.py` writes WPILOG output.
+  `tracker.py` holds robot tracking, `shot.py` handles shot detection, `runtime.py` owns console/progress behavior, `geometry.py` and `models.py` hold shared primitives, `helpers.py` contains field/manual/debug helpers, `wpilog.py` writes WPILOG output, `ftc_events.py` scrapes FTC Events pages, `hardware.py` collects machine diagnostics, and `dashboard_server.py` serves the local dashboard APIs.
+- `dashboard_static/`
+  Dashboard HTML/CSS/JS files for the local browser UI.
 - `util/juice_log.py`
   Shared JUICE LOG schema implementation for compact pose/shot logs.
 - `tools/calibrate.py`
@@ -31,12 +35,12 @@ This repository mixes Python tracking code, browser-based tooling, and documenta
 Install the main runtime dependencies:
 
 ```bash
-pip install opencv-python numpy progress scipy
+python3 -m pip install opencv-python numpy progress scipy
 ```
 
 Some workflows also need:
 
-- `yt-dlp` for YouTube downloads
+- `yt-dlp` for YouTube downloads. After a Python upgrade, reinstall it with `python3 -m pip install -U yt-dlp` so contributors do not keep using an older interpreter-specific launcher.
 - a local video file for tracker or calibration testing
 
 ## Development Expectations
@@ -54,7 +58,7 @@ Run the validation that matches your change.
 For Python changes, at minimum:
 
 ```bash
-python3 -m py_compile auto_scout.py autoscout/*.py util/juice_log.py tools/calibrate.py tools/debug.py
+python3 -m py_compile auto_scout.py dashboard_server.py autoscout/*.py util/juice_log.py tools/calibrate.py tools/debug.py
 ```
 
 If your change affects tracking, calibration, or exports, also do a realistic manual check when possible:
@@ -63,6 +67,7 @@ If your change affects tracking, calibration, or exports, also do a realistic ma
 - verify CSV, JLOG, and WPILOG outputs are created as expected
 - check any affected debug output
 - open the browser tools if you changed their UI or data flow
+- start `dashboard_server.py` and verify the relevant API or UI path if you changed dashboard behavior
 
 In your PR description, mention what you validated and what you did not validate.
 

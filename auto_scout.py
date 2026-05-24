@@ -1,9 +1,11 @@
 import argparse
+import base64
 import csv
 import json
 import math
 import os
 import sys
+from pathlib import Path
 
 from autoscout.geometry import _field_center_to_corner_xy
 from autoscout.helpers import (
@@ -12,10 +14,21 @@ from autoscout.helpers import (
     _draw_wire_cube,
     _open_debug_video_writer,
 )
+from autoscout.match_timer import scan_match_bounds
 from autoscout.runtime import _make_bar, _require, install_console_output
 from autoscout.shot import ShotDetector
 from autoscout.tracker import RobotTracker
 from autoscout.wpilog import WPILogWriter
+from autoscout.ytdlp import (
+    auth_help_message,
+    build_download_attempts,
+    find_yt_dlp_command,
+    get_yt_dlp_command_warning,
+    output_indicates_rate_limit,
+    rate_limit_help_message,
+    tls_help_message,
+    yt_dlp_network_backoff_args,
+)
 from util.juice_log import (
     CSV_COLUMNS,
     ROBOT_POSE_SCHEMA,
@@ -26,9 +39,75 @@ from util.juice_log import (
 
 SAVE_ALL_DEBUG_AROUND_MERGES = False
 PROCESS_EVERY_SOURCE_FRAME = True
+DASHBOARD_EVENT_PREFIX = "@@AUTOSCOUT_DASHBOARD@@"
 
 
 install_console_output()
+
+
+def _dashboard_mode_enabled():
+    return os.environ.get("AUTOSCOUT_DASHBOARD_MODE") == "1"
+
+
+def _dashboard_preview_interval():
+    raw = os.environ.get("AUTOSCOUT_DASHBOARD_PREVIEW_EVERY", "5").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 5
+
+
+def _emit_dashboard_event(kind, **payload):
+    if not _dashboard_mode_enabled():
+        return
+    event = {"kind": kind}
+    event.update(payload)
+    print(DASHBOARD_EVENT_PREFIX + json.dumps(event, separators=(",", ":")), flush=True)
+
+
+def _emit_dashboard_stage(stage, status, detail=""):
+    _emit_dashboard_event("stage", stage=stage, status=status, detail=detail)
+
+
+def _emit_dashboard_stage_progress(stage, detail, current, total):
+    total = max(1, int(total))
+    current = max(0, min(int(current), total))
+    _emit_dashboard_event(
+        "stage",
+        stage=stage,
+        status="in_progress",
+        detail=detail,
+        progress_current=current,
+        progress_total=total,
+        progress_fraction=(current / total),
+    )
+
+
+def _emit_dashboard_preview(cv2, frame, frame_num, match_time_s):
+    if not _dashboard_mode_enabled():
+        return
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), 70],
+    )
+    if not ok:
+        return
+    _emit_dashboard_event(
+        "preview",
+        frame_num=int(frame_num),
+        match_time_s=round(float(match_time_s), 2),
+        jpeg_b64=base64.b64encode(encoded.tobytes()).decode("ascii"),
+    )
+
+
+def _manual_corners_file_to_tracker_order(manual_corners_px):
+    if not manual_corners_px or len(manual_corners_px) != 4:
+        return manual_corners_px
+    # Saved calibration files are persisted as [BL, BR, TR, TL].
+    # The tracker homography expects [TL, TR, BR, BL].
+    bl, br, tr, tl = manual_corners_px
+    return [tl, tr, br, bl]
 
 
 def process_match(
@@ -43,14 +122,18 @@ def process_match(
     manual_corners_px=None,
     robot_init_positions=None,
     manual_reference_csv=None,
+    auto_match_bounds=False,
 ):
     cv2 = _require("cv2", "opencv-python")
     np = _require("numpy")
+    dashboard_stream_previews = _dashboard_mode_enabled() and debug and not debug_video
 
     os.makedirs(output_dir, exist_ok=True)
 
+    _emit_dashboard_stage("Loading Match Footage", "in_progress", "Opening match footage")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        _emit_dashboard_stage("Loading Match Footage", "failed", "Unable to open match footage")
         print("[ERROR] Cannot open: {}".format(video_path))
         sys.exit(1)
 
@@ -60,11 +143,54 @@ def process_match(
         video_fps, total_frames, total_frames / video_fps))
 
     start_frame = int(start_offset_sec * video_fps)
+    stop_frame = total_frames - 1
+    if auto_match_bounds:
+        timer_scan = scan_match_bounds(
+            video_path,
+            cv2,
+            np,
+            progress_callback=lambda current, total: _emit_dashboard_stage_progress(
+                "Loading Match Footage",
+                "Scanning broadcast timer for match bounds",
+                current,
+                total,
+            ),
+        )
+        auto_start_frame = timer_scan.get("start_frame")
+        auto_stop_frame = timer_scan.get("stop_frame")
+        if auto_start_frame is not None:
+            start_frame = max(0, int(auto_start_frame))
+            start_offset_sec = start_frame / video_fps
+            print("[INFO] Auto-detected match start at {:.2f}s (frame {}).".format(
+                start_offset_sec,
+                start_frame,
+            ))
+        else:
+            start_offset_sec = 0.0
+            start_frame = 0
+            print("[WARN] Could not auto-detect the match start timer. Starting from frame 0.")
+        if auto_stop_frame is not None:
+            stop_frame = int(auto_stop_frame)
+            stop_time_s = stop_frame / video_fps
+            print("[INFO] Auto-detected match end at {:.2f}s (frame {}).".format(
+                stop_time_s,
+                stop_frame,
+            ))
+        else:
+            print("[WARN] Could not auto-detect the end of match timer. Processing until the video ends.")
+    else:
+        print("[INFO] Using explicit start offset of {:.2f}s (frame {}).".format(
+            start_offset_sec,
+            start_frame,
+        ))
+
     frame_step = max(1, int(round(video_fps / sample_rate_fps)))
     if PROCESS_EVERY_SOURCE_FRAME:
         frame_step = 1
     print("[INFO] Processing every {} frames (~{:.1f} fps output)".format(
         frame_step, video_fps / frame_step))
+    _emit_dashboard_stage("Loading Match Footage", "completed", "Match footage is ready")
+    _emit_dashboard_stage("Calibrating Trackers", "in_progress", "Preparing tracker calibration")
     if debug:
         if debug_video:
             print("[INFO] Writing debug video from frames sampled about every {} source frames".format(
@@ -77,7 +203,7 @@ def process_match(
     csv_path = os.path.join(output_dir, "robot_positions.csv")
     jlog_path = os.path.join(output_dir, "robot_positions.jlog")
     wpilog_path = os.path.join(output_dir, "match_log.wpilog")
-    debug_dir = os.path.join(output_dir, "tracker_debug") if (debug and not debug_video) else None
+    debug_dir = os.path.join(output_dir, "tracker_debug") if (debug and not debug_video and not dashboard_stream_previews) else None
     debug_video_path = os.path.join(output_dir, "tracker_debug.mp4") if (debug and debug_video) else None
 
     if debug_dir:
@@ -143,13 +269,15 @@ def process_match(
                 debug_video_path, debug_codec, debug_fps))
 
     if manual_corners_px:
-        ordered = np.array(manual_corners_px, dtype=np.float32)
+        ordered = np.array(_manual_corners_file_to_tracker_order(manual_corners_px), dtype=np.float32)
         dst2d = np.array([[0, 0], [144, 0], [144, 144], [0, 144]], dtype=np.float32)
         H_2d, _ = cv2.findHomography(ordered, dst2d)
         H_inv = np.linalg.inv(H_2d)
         tracker.setup(video_path, ordered, frame_shape)
         shot_detector.setup(tracker)
         print("[INFO] Using manual field corners.")
+        _emit_dashboard_stage("Calibrating Trackers", "completed", "Using manual field corners")
+        _emit_dashboard_stage("Tracking Match", "in_progress", "Tracking robots across the match")
         if tracker._bg is not None:
             cv2.imwrite(os.path.join(output_dir, "median_background.jpg"), tracker._bg)
 
@@ -193,17 +321,23 @@ def process_match(
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame if start_frame > 0 else 0)
 
     debug_colors = [(220, 160, 0), (0, 220, 255), (0, 0, 220), (0, 120, 255)]
-    frames_to_process = max(1, (total_frames - start_frame + frame_step - 1) // frame_step)
+    end_frame_exclusive = min(total_frames, stop_frame + 1)
+    frames_to_process = max(1, (end_frame_exclusive - start_frame + frame_step - 1) // frame_step)
     bar = _make_bar("Processing frames", frames_to_process)
     merge_debug_hold = 0
     dense_merge_hold = 0
     next_debug_source_frame = start_frame
+    dashboard_preview_every = max(debug_every_n, _dashboard_preview_interval()) if dashboard_stream_previews else max(1, debug_every_n)
+    calibration_completed = H_inv is not None
+    tracking_started = H_inv is not None
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
         current_frame_num = frame_num
+        if current_frame_num > stop_frame:
+            break
         match_time_s = current_frame_num / video_fps - start_offset_sec
         timestamp_us = max(0, int(match_time_s * 1_000_000))
         frame_num += 1
@@ -213,6 +347,13 @@ def process_match(
             continue
 
         bar.next()
+        if processed == 0 or processed % 30 == 0 or processed + 1 >= frames_to_process:
+            _emit_dashboard_stage_progress(
+                "Tracking Match",
+                "Tracking robots across the match",
+                processed + 1,
+                frames_to_process,
+            )
 
         if ordered is None:
             result = field_detector.detect_field(frame)
@@ -222,6 +363,11 @@ def process_match(
                 tracker.setup(video_path, ordered, frame.shape)
                 shot_detector.setup(tracker)
                 print("\n  [t={:.1f}s] Field auto-detected.".format(match_time_s))
+                calibration_completed = True
+                _emit_dashboard_stage("Calibrating Trackers", "completed", "Field auto-detected")
+                if not tracking_started:
+                    tracking_started = True
+                    _emit_dashboard_stage("Tracking Match", "in_progress", "Tracking robots across the match")
                 if tracker._bg is not None:
                     cv2.imwrite(os.path.join(output_dir, "median_background.jpg"), tracker._bg)
 
@@ -271,7 +417,7 @@ def process_match(
         csv_writer.writerow(csv_row_to_list(row))
         jlog_writer.append_row(row)
 
-        if debug and H_inv is not None and (debug_dir or debug_writer is not None):
+        if debug and H_inv is not None and (dashboard_stream_previews or debug_dir or debug_writer is not None):
             dbg = frame.copy()
             fg_debug = None
             if ordered is not None:
@@ -375,13 +521,15 @@ def process_match(
             cv2.putText(dbg, "t={:.2f}s f={}  [{}]".format(
                         match_time_s, current_frame_num, label),
                         (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
-            base_debug_interval = max(1, debug_every_n)
+            base_debug_interval = dashboard_preview_every
             save_debug = (current_frame_num >= next_debug_source_frame
                           or (SAVE_ALL_DEBUG_AROUND_MERGES and
                               (merge_active or merge_debug_hold > 0)))
             if save_debug:
                 if debug_writer is not None:
                     debug_writer.write(dbg)
+                elif dashboard_stream_previews:
+                    _emit_dashboard_preview(cv2, dbg, current_frame_num, match_time_s)
                 elif debug_dir is not None:
                     cv2.imwrite(os.path.join(debug_dir,
                                 "frame_{:06d}.jpg".format(current_frame_num)), dbg)
@@ -400,6 +548,11 @@ def process_match(
 
         processed += 1
 
+    if not calibration_completed:
+        _emit_dashboard_stage("Calibrating Trackers", "failed", "Field calibration could not be established")
+    elif tracking_started:
+        _emit_dashboard_stage("Tracking Match", "completed", "Tracking loop finished")
+    _emit_dashboard_stage("Cleaning Up", "in_progress", "Finalizing outputs")
     bar.finish()
     if debug_writer is not None:
         debug_writer.release()
@@ -412,7 +565,9 @@ def process_match(
     print("  JLOG:   {}".format(jlog_path))
     print("  WPILOG: {}".format(wpilog_path))
     if debug:
-        print("  Debug:  {}".format(debug_video_path if debug_video_path else debug_dir))
+        debug_location = debug_video_path if debug_video_path else (debug_dir or "dashboard stream")
+        print("  Debug:  {}".format(debug_location))
+    _emit_dashboard_stage("Cleaning Up", "completed", "Outputs are ready")
     _print_instructions()
 
 
@@ -441,31 +596,127 @@ def download_video(url, output_dir):
     import subprocess
 
     out = os.path.join(output_dir, "match_video.mp4")
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        print("[INFO] Reusing previously downloaded match video:", out)
+        _emit_dashboard_stage("Loading Match Footage", "completed", "Reusing previously downloaded match footage")
+        return out
     print("[INFO] Downloading:", url)
-    bar = _make_bar("Downloading", 100)
-    last_pct = 0
-    proc = subprocess.Popen(
-        ["yt-dlp", "-f", "best[ext=mp4]", "-o", out, url,
-         "--progress-template", "%(progress._percent_str)s"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if proc.stdout:
-        for line in proc.stdout:
-            try:
-                pct = int(float(line.strip().rstrip("%")))
-                while last_pct < pct:
-                    bar.next()
-                    last_pct += 1
-            except ValueError:
-                pass
-    proc.wait()
-    while last_pct < 100:
-        bar.next()
-        last_pct += 1
-    bar.finish()
-    if proc.returncode != 0:
-        print("[ERROR] yt-dlp failed")
+    _emit_dashboard_stage("Loading Match Footage", "in_progress", "Downloading match footage from YouTube")
+    yt_dlp_cmd = find_yt_dlp_command()
+    if not yt_dlp_cmd:
+        _emit_dashboard_stage("Loading Match Footage", "failed", "yt-dlp is not available")
+        print("[ERROR] yt-dlp is not installed for this Python and was not found on PATH.")
         sys.exit(1)
-    return out
+    yt_dlp_warning = get_yt_dlp_command_warning(yt_dlp_cmd)
+    if yt_dlp_warning:
+        print(yt_dlp_warning)
+    attempts, attempt_notes = build_download_attempts(
+        [Path.cwd(), Path(__file__).resolve().parent, Path(output_dir).resolve()]
+    )
+    for note in attempt_notes:
+        print(note)
+    last_recent_output = []
+
+    for attempt_index, attempt in enumerate(attempts, start=1):
+        if attempt_index > 1:
+            print("[INFO] Retrying yt-dlp with {}...".format(attempt["label"]))
+        bar = _make_bar("Downloading", 100)
+        last_pct = 0
+        recent_output = []
+        proc = subprocess.Popen(
+            [
+                *yt_dlp_cmd,
+                "--no-playlist",
+                "--merge-output-format", "mp4",
+                *yt_dlp_network_backoff_args(),
+                "-o", out,
+                *attempt["args"],
+                url,
+                "--progress-template", "%(progress._percent_str)s",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True)
+        if proc.stdout:
+            for line in proc.stdout:
+                stripped = line.strip()
+                if stripped:
+                    recent_output.append(stripped)
+                    recent_output = recent_output[-12:]
+                try:
+                    pct = int(float(stripped.rstrip("%")))
+                    while last_pct < pct:
+                        bar.next()
+                        last_pct += 1
+                    _emit_dashboard_stage_progress(
+                        "Loading Match Footage",
+                        "Downloading match footage from YouTube",
+                        last_pct,
+                        100,
+                    )
+                except ValueError:
+                    pass
+        proc.wait()
+        while last_pct < 100:
+            bar.next()
+            last_pct += 1
+            _emit_dashboard_stage_progress(
+                "Loading Match Footage",
+                "Downloading match footage from YouTube",
+                last_pct,
+                100,
+            )
+        bar.finish()
+        last_recent_output = recent_output
+        if proc.returncode == 0 and os.path.exists(out):
+            _emit_dashboard_stage("Loading Match Footage", "completed", "Downloaded match footage from YouTube")
+            return out
+        if output_indicates_rate_limit(recent_output):
+            print("[WARN] yt-dlp hit a YouTube 429 / Too Many Requests response. Stopping further retries to avoid additional throttling.")
+            break
+
+    if last_recent_output:
+        _emit_dashboard_stage("Loading Match Footage", "failed", "Unable to download match footage from YouTube")
+        print("[ERROR] yt-dlp failed. Last output:")
+        for item in last_recent_output:
+            print("  {}".format(item))
+        joined_output = "\n".join(item.lower() for item in last_recent_output)
+        blocked_by_youtube = (
+            "sign in to confirm you're not a bot" in joined_output
+            or "sign in to confirm you’re not a bot" in joined_output
+            or "precondition check failed" in joined_output
+            or "po token" in joined_output
+        )
+        tls_failed = (
+            "certificate_verify_failed" in joined_output
+            or "unable to get local issuer certificate" in joined_output
+        )
+        storyboards_only = (
+            "only images are available for download" in joined_output
+            or "requested format is not available" in joined_output
+        )
+        if tls_failed:
+            print("[ERROR] Python TLS certificate verification failed. {}".format(
+                tls_help_message()
+            ))
+        elif blocked_by_youtube:
+            print("[ERROR] YouTube is challenging this session/IP. The anonymous retry paths were exhausted. {}".format(
+                auth_help_message()
+            ))
+        elif storyboards_only:
+            print("[ERROR] YouTube only exposed storyboard/blocked formats to the anonymous clients we tried. {}".format(
+                auth_help_message()
+            ))
+        elif "nsig extraction failed" in joined_output:
+            print("[ERROR] Your installed yt-dlp may be outdated. Updating yt-dlp often fixes this YouTube extractor error.")
+        if output_indicates_rate_limit(last_recent_output):
+            print("[ERROR] {}".format(rate_limit_help_message()))
+        if "operation not permitted" in joined_output and "cookies" in joined_output:
+            print("[ERROR] yt-dlp could not read a protected browser cookie store. {}".format(auth_help_message()))
+    else:
+        _emit_dashboard_stage("Loading Match Footage", "failed", "Unable to download match footage from YouTube")
+        print("[ERROR] yt-dlp failed")
+    sys.exit(1)
 
 
 def main():
@@ -475,6 +726,8 @@ def main():
     parser.add_argument("--output-dir", default="./output")
     parser.add_argument("--start-offset", type=float, default=0.0,
                         help="Seconds to skip before match timer starts")
+    parser.add_argument("--auto-match-bounds", action="store_true",
+                        help="Auto-detect match start/end from the broadcast timer")
     parser.add_argument("--sample-rate", type=float, default=10.0,
                         help="Frames per second to process (default 10)")
     parser.add_argument("--debug", action="store_true",
@@ -548,6 +801,7 @@ def main():
         manual_corners_px=corners,
         robot_init_positions=robot_init,
         manual_reference_csv=args.manual_reference_csv,
+        auto_match_bounds=args.auto_match_bounds,
     )
 
 
