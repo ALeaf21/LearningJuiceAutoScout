@@ -1,12 +1,6 @@
 ![Project Header Image](assets/Project-REDACTED-Header.png)
 
-# *FIRST* Tech Challenge Automatic Scouter
-| Codename | **Project REDACTED** |
-| -------- | ---------------------|
-
-
-*This project is developed by **Ray Enterprises' R&D** (ARED) for use by FTC Team Juice 16236.*
-
+# *FIRST* Tech Challenge Automatic Scouter (Project REDACTED)
 
 https://github.com/user-attachments/assets/64045d5d-e12f-4a64-a7b1-fd415e46685a
 
