@@ -1,9 +1,9 @@
 ![Project Header Image](assets/Project-REDACTED-Header.png)
 
 # *FIRST* Tech Challenge Automatic Scouter
-| Internal Codename | **Project REDACTED** |
-| -------- | -------- |
-| rayID Designation | RE-016236-08 |
+| Codename | **Project REDACTED** |
+| -------- | ---------------------|
+
 
 *This project is developed by **Ray Enterprises' R&D** (ARED) for use by FTC Team Juice 16236.*
 
