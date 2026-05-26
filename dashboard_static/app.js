@@ -1,5 +1,18 @@
 const ROUTES = ["overview", "process", "calibration", "settings"];
 const STORAGE_KEY = "juice_dashboard_event_v2";
+const AUTO_QUEUE_DISCOVERY_INTERVAL_MS = 45000;
+const AUTO_QUEUE_RATE_LIMIT_RESET_MS = 30 * 60 * 1000;
+const AUTO_QUEUE_RATE_LIMIT_BASE_COOLDOWN_MS = 2 * 60 * 1000;
+const AUTO_QUEUE_RATE_LIMIT_MAX_COOLDOWN_MS = 20 * 60 * 1000;
+const AUTO_QUEUE_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const AUTO_QUEUE_ACTIVE_STATUSES = new Set(["queued", "running", "stopping"]);
+const DEFAULT_JOB_DURATION_MS = 9 * 60 * 1000;
+const PROCESS_STAGE_WEIGHTS = {
+  "Loading Match Footage": 0.14,
+  "Calibrating Trackers": 0.16,
+  "Tracking Match": 0.60,
+  "Cleaning Up": 0.10,
+};
 const PROCESS_STAGE_NAMES = [
   "Loading Match Footage",
   "Calibrating Trackers",
@@ -14,12 +27,22 @@ const state = {
   usage: null,
   examples: null,
   downloadedVideos: [],
+  storedArtifacts: [],
+  eventAssetsRequestId: 0,
   settings: null,
   currentEvent: null,
   jobs: [],
   route: "select",
   processMatchKey: null,
   selectedOverviewTeam: null,
+  autoQueueEnabled: false,
+  autoQueueTickInFlight: false,
+  autoQueueDiscoverInFlight: false,
+  autoQueueLastDiscoverAt: 0,
+  autoQueueCooldownUntil: 0,
+  autoQueueConsecutive429s: 0,
+  autoQueueLast429At: 0,
+  autoQueueHandledRateLimitedJobIds: [],
   processJobPollInFlight: false,
   calibration: {
     videoUrl: null,
@@ -69,6 +92,10 @@ function bindDom() {
   dom.selectStatus = document.getElementById("selectStatus");
   dom.eventTitle = document.getElementById("eventTitle");
   dom.reloadEventButton = document.getElementById("reloadEventButton");
+  dom.globalQueueTitle = document.getElementById("globalQueueTitle");
+  dom.globalQueueMeta = document.getElementById("globalQueueMeta");
+  dom.globalQueueEstimate = document.getElementById("globalQueueEstimate");
+  dom.globalStartButton = document.getElementById("globalStartButton");
   dom.matchList = document.getElementById("matchList");
   dom.statusDonut = document.getElementById("statusDonut");
   dom.statusLegend = document.getElementById("statusLegend");
@@ -115,6 +142,7 @@ function bindEvents() {
   dom.eventCodeInput.addEventListener("input", updateResolvedEventUrl);
   dom.eventForm.addEventListener("submit", handleEventLoad);
   dom.reloadEventButton.addEventListener("click", reloadCurrentEvent);
+  dom.globalStartButton.addEventListener("click", toggleGlobalQueue);
   dom.refreshUsageButton.addEventListener("click", loadUsage);
   dom.processBackButton.addEventListener("click", () => setRoute("overview"));
   dom.processStartButton.addEventListener("click", startCurrentProcessMatch);
@@ -149,6 +177,9 @@ function initializeState() {
   if (saved && saved.currentEvent) {
     state.currentEvent = saved.currentEvent;
   }
+  if (saved && typeof saved.autoQueueEnabled === "boolean") {
+    state.autoQueueEnabled = saved.autoQueueEnabled;
+  }
 }
 
 async function boot() {
@@ -167,6 +198,11 @@ async function boot() {
     setRoute("select");
   }
   setInterval(refreshJobs, 2500);
+  setInterval(() => {
+    if (state.autoQueueEnabled) {
+      maybeRunAutoQueue();
+    }
+  }, 2500);
   setInterval(() => {
     if (state.route === "process" && state.processMatchKey) {
       refreshCurrentProcessJob();
@@ -232,8 +268,10 @@ async function loadSettings() {
 
 async function refreshJobs() {
   try {
+    const previousJobs = state.jobs;
     const payload = await apiGet("/api/jobs");
     state.jobs = payload.jobs || [];
+    handleAutoQueueJobUpdates(previousJobs, state.jobs);
     if (state.currentEvent) {
       loadDownloadedVideos();
     }
@@ -242,6 +280,9 @@ async function refreshJobs() {
     renderCalibrationSources();
     if (state.route === "process") {
       renderProcessView();
+    }
+    if (state.autoQueueEnabled) {
+      void maybeRunAutoQueue();
     }
   } catch (_error) {
     state.jobs = [];
@@ -292,8 +333,11 @@ function showEventWorkspace(eventPayload, persist = true) {
     matches,
   };
   if (persist) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ currentEvent: state.currentEvent }));
+    saveDashboardState();
   }
+  state.downloadedVideos = [];
+  state.storedArtifacts = [];
+  state.eventAssetsRequestId += 1;
   dom.mainNav.classList.remove("hidden");
   dom.brandSubtitle.textContent = `${state.currentEvent.title} • ${state.currentEvent.event_code} • ${state.currentEvent.season}`;
   loadDownloadedVideos();
@@ -307,21 +351,40 @@ function showEventWorkspace(eventPayload, persist = true) {
 async function loadDownloadedVideos() {
   if (!state.currentEvent?.event_code) {
     state.downloadedVideos = [];
+    state.storedArtifacts = [];
+    state.eventAssetsRequestId += 1;
     renderCalibrationSources();
     return;
   }
-  state.downloadedVideos = [];
-  renderCalibrationSources();
+  const requestId = state.eventAssetsRequestId + 1;
+  state.eventAssetsRequestId = requestId;
+  const eventCode = state.currentEvent.event_code;
   try {
-    const payload = await apiGet(`/api/event/downloads?event_code=${encodeURIComponent(state.currentEvent.event_code)}`);
-    if (payload.event_code && payload.event_code !== state.currentEvent.event_code) {
+    const [downloadsPayload, artifactsPayload] = await Promise.all([
+      apiGet(`/api/event/downloads?event_code=${encodeURIComponent(eventCode)}`),
+      apiGet(`/api/event/artifacts?event_code=${encodeURIComponent(eventCode)}`),
+    ]);
+    if (state.eventAssetsRequestId !== requestId || state.currentEvent?.event_code !== eventCode) {
       return;
     }
-    state.downloadedVideos = payload.videos || [];
+    if (downloadsPayload.event_code && downloadsPayload.event_code !== eventCode) {
+      return;
+    }
+    if (artifactsPayload.event_code && artifactsPayload.event_code !== eventCode) {
+      return;
+    }
+    state.downloadedVideos = downloadsPayload.videos || [];
+    state.storedArtifacts = artifactsPayload.artifacts || [];
     renderCalibrationSources();
+    renderOverview();
+    renderProgressNudge();
+    if (state.route === "process") {
+      renderProcessView();
+    }
   } catch (_error) {
-    state.downloadedVideos = [];
-    renderCalibrationSources();
+    if (state.eventAssetsRequestId !== requestId || state.currentEvent?.event_code !== eventCode) {
+      return;
+    }
   }
 }
 
@@ -354,6 +417,13 @@ function setRoute(route) {
     window.location.hash = "#" + route;
   }
   renderRoute();
+}
+
+function saveDashboardState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    currentEvent: state.currentEvent,
+    autoQueueEnabled: state.autoQueueEnabled,
+  }));
 }
 
 function syncRouteFromHash() {
@@ -414,6 +484,7 @@ function renderOverview() {
   dom.eventTitle.textContent = state.currentEvent.title;
   const qualificationMatches = currentQualificationMatches();
   const counts = computeStatusCounts(qualificationMatches);
+  renderGlobalQueueCard(counts);
   dom.matchList.innerHTML = qualificationMatches.map((match) => renderMatchCard(match)).join("") || `<div class="empty-state">No qualification matches found.</div>`;
   dom.matchList.querySelectorAll("[data-open-match]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -433,6 +504,53 @@ function renderOverview() {
   });
   renderDonut(counts);
   renderAgentGrid(counts);
+}
+
+function renderGlobalQueueCard(counts) {
+  const parallelLimit = normalizedParallelTrackJobs();
+  const activeJobs = activeJobsForEvent().length;
+  const openSlots = Math.max(parallelLimit - activeJobs, 0);
+  const readyMatches = autoQueueEligibleMatches().length;
+  const upcomingMatches = Math.max(0, counts.upcoming);
+  const processedAll = counts.total > 0 && counts.processed >= counts.total;
+  const cooldownRemainingMs = Math.max(0, state.autoQueueCooldownUntil - Date.now());
+  dom.globalQueueEstimate.textContent = buildOverviewEstimateText();
+  if (state.autoQueueEnabled) {
+    dom.globalStartButton.textContent = "Stop Auto Queue";
+    dom.globalStartButton.classList.remove("primary");
+    dom.globalStartButton.classList.add("danger");
+    if (cooldownRemainingMs > 0) {
+      dom.globalQueueTitle.textContent = "Cooling down after a YouTube 429";
+      dom.globalQueueMeta.textContent = `Waiting ${formatDurationShort(cooldownRemainingMs)} before starting another download. Already running jobs will continue, and the queue will resume automatically after the cooldown.`;
+    } else if (activeJobs >= parallelLimit) {
+      dom.globalQueueTitle.textContent = `Running at capacity: ${activeJobs} of ${parallelLimit} jobs`;
+      dom.globalQueueMeta.textContent = readyMatches > 0
+        ? `${readyMatches} more ready matches are waiting for an open slot.`
+        : upcomingMatches > 0
+          ? `Watching ${upcomingMatches} upcoming matches and refreshing event clips automatically.`
+          : "Every discovered match has either finished or is already assigned.";
+    } else if (hasActiveLoadingFootageJob()) {
+      dom.globalQueueTitle.textContent = "Staggering downloads to avoid rate limits";
+      dom.globalQueueMeta.textContent = `A match is currently in the footage-loading stage. The queue will start the next download after that stage clears so we do not hammer YouTube back-to-back.`;
+    } else if (readyMatches > 0) {
+      dom.globalQueueTitle.textContent = `Ready to fill ${openSlots} open slot${openSlots === 1 ? "" : "s"}`;
+      dom.globalQueueMeta.textContent = `Auto queue will keep up to ${parallelLimit} parallel job${parallelLimit === 1 ? "" : "s"} active, but it will only open one new YouTube download lane at a time to stay under the 429 threshold longer.`;
+    } else if (processedAll) {
+      dom.globalQueueTitle.textContent = "All qualification matches are processed";
+      dom.globalQueueMeta.textContent = "Auto queue is still on, but there is no remaining work for this event.";
+    } else {
+      dom.globalQueueTitle.textContent = "Waiting for the next match video";
+      dom.globalQueueMeta.textContent = upcomingMatches > 0
+        ? `No ready clips right now. The dashboard will keep checking and start them when they appear.`
+        : "No ready matches are available right now.";
+    }
+  } else {
+    dom.globalStartButton.textContent = "Start All";
+    dom.globalStartButton.classList.add("primary");
+    dom.globalStartButton.classList.remove("danger");
+    dom.globalQueueTitle.textContent = "Automatic processing is idle";
+    dom.globalQueueMeta.textContent = `Will run up to ${parallelLimit} parallel match job${parallelLimit === 1 ? "" : "s"} based on your current hardware settings.`;
+  }
 }
 
 function renderMatchCard(match) {
@@ -478,7 +596,7 @@ function renderDonut(counts) {
       <circle cx="60" cy="60" r="50" fill="none" stroke="#211910" stroke-width="16"></circle>
       ${circles}
       <text x="60" y="56" text-anchor="middle" fill="#e2e2e2" font-size="16" font-weight="700">${counts.total}</text>
-      <text x="60" y="74" text-anchor="middle" fill="#ababab" font-size="10">qualification matches</text>
+      <text x="60" y="74" text-anchor="middle" fill="#ababab" font-size="10">matches</text>
     </svg>
   `;
   dom.statusLegend.innerHTML = entries.map((entry) => `
@@ -587,7 +705,7 @@ function renderProcessView() {
     dom.processStats.innerHTML = `<div class="empty-state">No match selected.</div>`;
     dom.processChecklist.innerHTML = renderChecklistRows(null);
     dom.processLogs.textContent = "No process output yet.";
-    dom.processPreviewShell.innerHTML = `<div class="empty-state">No preview available yet.</div>`;
+    renderProcessPreview(null);
     dom.processVisualizerShell.innerHTML = `<div class="empty-state">The data visualizer will appear here after a match finishes and exports robot position data.</div>`;
     renderProcessAuthNotice(null);
     return;
@@ -617,25 +735,29 @@ function renderProcessView() {
     dom.processStartButton.textContent = meta.label === "Processed" ? "Reprocess Match" : "Start Processing";
   }
 
-  if (job && job.latest_preview_url) {
-    if ((job.latest_preview_path || "").toLowerCase().endsWith(".mp4")) {
-      dom.processPreviewShell.innerHTML = `<video controls src="${escapeHtmlAttr(job.latest_preview_url)}"></video>`;
-    } else {
-      dom.processPreviewShell.innerHTML = `<img src="${escapeHtmlAttr(job.latest_preview_url)}" alt="Latest process preview">`;
-    }
-  } else {
-    dom.processPreviewShell.innerHTML = `<div class="empty-state">No preview available yet. Dashboard jobs produce previews when debug frames are enabled.</div>`;
-  }
+  renderProcessPreview(job);
 
   const stats = [
     statCard("Status", meta.label),
     statCard("Phase", match.phase),
     statCard("Video", match.video_url ? "Available" : "Not found"),
-    statCard("Latest job", job ? (job.job_id + (job.return_code != null ? ` • rc ${job.return_code}` : "")) : "None"),
-    statCard("Debug frames", job ? String(job.debug_frames_count ?? 0) : "0"),
-    statCard("Output", job && job.output_dir ? escapeHtml(job.output_dir) : "Not started"),
+    statCard("Latest job", latestJobLabel(job)),
+    statCard("Estimate", buildProcessEstimateText(match, job)),
+    processOutputStatCard(job && job.output_dir ? job.output_dir : ""),
   ];
   dom.processStats.innerHTML = stats.join("");
+  dom.processStats.querySelectorAll("[data-copy-path]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const path = String(button.dataset.copyPath || "");
+      if (!path) {
+        return;
+      }
+      const copied = await copyTextToClipboard(path);
+      if (copied) {
+        flashButtonLabel(button, "Copied");
+      }
+    });
+  });
   dom.processChecklist.innerHTML = renderChecklistRows(job);
   renderProcessVisualizer(job);
   renderProcessAuthNotice(job);
@@ -646,6 +768,82 @@ function renderProcessView() {
 
 function statCard(label, value) {
   return `<div class="stat-card"><div class="section-title">${label}</div><strong>${value}</strong></div>`;
+}
+
+function renderProcessPreview(job) {
+  const previewUrl = job?.latest_preview_url || "";
+  const previewPath = String(job?.latest_preview_path || "").toLowerCase();
+  if (!previewUrl) {
+    dom.processPreviewShell.dataset.previewKind = "empty";
+    dom.processPreviewShell.dataset.previewUrl = "";
+    dom.processPreviewShell.innerHTML = `<div class="empty-state">No preview available yet. Dashboard jobs produce previews when debug frames are enabled.</div>`;
+    return;
+  }
+
+  if (previewPath.endsWith(".mp4")) {
+    if (
+      dom.processPreviewShell.dataset.previewKind === "video"
+      && dom.processPreviewShell.dataset.previewUrl === previewUrl
+    ) {
+      return;
+    }
+    dom.processPreviewShell.dataset.previewKind = "video";
+    dom.processPreviewShell.dataset.previewUrl = previewUrl;
+    dom.processPreviewShell.innerHTML = `<video class="process-preview-media" controls src="${escapeHtmlAttr(previewUrl)}"></video>`;
+    return;
+  }
+
+  renderProcessPreviewImage(previewUrl);
+}
+
+function renderProcessPreviewImage(previewUrl) {
+  const currentKind = dom.processPreviewShell.dataset.previewKind || "";
+  const currentUrl = dom.processPreviewShell.dataset.previewUrl || "";
+  if (currentKind === "image" && currentUrl === previewUrl) {
+    return;
+  }
+
+  const requestId = String((Number(dom.processPreviewShell.dataset.previewRequestId || "0") || 0) + 1);
+  dom.processPreviewShell.dataset.previewRequestId = requestId;
+  const preloadImage = new Image();
+  preloadImage.decoding = "async";
+  preloadImage.onload = () => {
+    if (dom.processPreviewShell.dataset.previewRequestId !== requestId) {
+      return;
+    }
+    let img = dom.processPreviewShell.querySelector("img.process-preview-media");
+    if (!img) {
+      dom.processPreviewShell.innerHTML = `<img class="process-preview-media" alt="Latest process preview">`;
+      img = dom.processPreviewShell.querySelector("img.process-preview-media");
+    }
+    if (!img) {
+      return;
+    }
+    img.src = previewUrl;
+    dom.processPreviewShell.dataset.previewKind = "image";
+    dom.processPreviewShell.dataset.previewUrl = previewUrl;
+  };
+  preloadImage.src = previewUrl;
+}
+
+function processOutputStatCard(path) {
+  if (!path) {
+    return statCard("Output", "Not started");
+  }
+  return `
+    <div class="stat-card stat-card-path">
+      <div class="section-title">Output</div>
+      <button
+        type="button"
+        class="stat-path-btn"
+        data-copy-path="${escapeHtmlAttr(path)}"
+        title="${escapeHtmlAttr(path)}"
+        aria-label="Copy output path"
+      >
+        <span class="stat-path-text">${escapeHtml(path)}</span>
+      </button>
+    </div>
+  `;
 }
 
 function renderChecklistRows(job) {
@@ -749,7 +947,7 @@ function getProcessAuthIssue(job) {
   if (!job || !Array.isArray(job.log_tail) || !job.log_tail.length) {
     return "";
   }
-  const joinedOutput = job.log_tail.join("\n").toLowerCase();
+  const joinedOutput = normalizedJobOutput(job);
   const tlsFailed = (
     joinedOutput.includes("certificate_verify_failed")
     || joinedOutput.includes("unable to get local issuer certificate")
@@ -762,12 +960,7 @@ function getProcessAuthIssue(job) {
       `If that still fails, reinstall <code>yt-dlp</code> with <code>python3 -m pip install -U yt-dlp</code>.`
     );
   }
-  const rateLimited = (
-    joinedOutput.includes("http error 429")
-    || joinedOutput.includes("too many requests")
-    || joinedOutput.includes("rate-limiting this machine")
-  );
-  if (rateLimited) {
+  if (jobIndicatesRateLimit(job)) {
     return (
       `<strong>YouTube is rate-limiting this machine.</strong>` +
       `Wait a bit before retrying, avoid starting several downloads back-to-back, and if this keeps happening ` +
@@ -815,6 +1008,17 @@ async function startCurrentProcessMatch() {
   if (!match || !match.video_url) {
     return;
   }
+  await startMatchProcessing(match, {
+    focusMatch: true,
+    openProcessView: Boolean(state.settings?.auto_open_process_view),
+  });
+}
+
+async function startMatchProcessing(match, options = {}) {
+  const {
+    focusMatch = false,
+    openProcessView = false,
+  } = options;
   const outputRoot = (state.settings && state.settings.output_root) || "./output_dashboard";
   const outputDir = `${outputRoot.replace(/\/$/, "")}/${state.currentEvent.event_code}/${slugify(match.label)}`;
   try {
@@ -830,15 +1034,24 @@ async function startCurrentProcessMatch() {
       match_label: match.label,
       match_phase: match.phase,
     });
-    state.processMatchKey = match.match_key;
+    mergeJobIntoState(payload);
+    if (focusMatch) {
+      state.processMatchKey = match.match_key;
+    }
     await refreshJobs();
-    if (state.settings?.auto_open_process_view) {
+    if (openProcessView) {
       setRoute("process");
     }
-    await refreshCurrentProcessJob();
-    dom.processLogs.textContent = (payload.log_tail || []).join("\n") || "Job started.";
+    if (focusMatch) {
+      await refreshCurrentProcessJob();
+      dom.processLogs.textContent = (payload.log_tail || []).join("\n") || "Job started.";
+    }
+    return payload;
   } catch (error) {
-    dom.processLogs.textContent = error.message;
+    if (focusMatch) {
+      dom.processLogs.textContent = error.message;
+    }
+    throw error;
   }
 }
 
@@ -859,8 +1072,8 @@ async function copyProcessLogs() {
     return;
   }
   try {
-    await navigator.clipboard.writeText(content);
-    setCopyLogsButtonState("Copied");
+    const copied = await copyTextToClipboard(content);
+    setCopyLogsButtonState(copied ? "Copied" : "Copy Failed");
   } catch (_error) {
     setCopyLogsButtonState("Copy Failed");
   }
@@ -1205,6 +1418,37 @@ function setCopyLogsButtonState(label) {
   }, 1300);
 }
 
+function flashButtonLabel(button, label) {
+  if (!button) {
+    return;
+  }
+  const textNode = button.querySelector(".stat-path-text");
+  if (!textNode) {
+    return;
+  }
+  const original = button.dataset.originalLabel || textNode.textContent || "";
+  button.dataset.originalLabel = original;
+  textNode.textContent = label;
+  button.classList.add("copied");
+  window.clearTimeout(button._restoreLabelTimer);
+  button._restoreLabelTimer = window.setTimeout(() => {
+    textNode.textContent = original;
+    button.classList.remove("copied");
+  }, 1100);
+}
+
+async function copyTextToClipboard(content) {
+  if (!String(content || "").trim()) {
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(content);
+    return true;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function downloadCornersJson() {
   const payload = currentCornersPayload();
   const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], { type: "application/json" });
@@ -1289,13 +1533,70 @@ function jobsForEvent() {
   return state.jobs.filter((job) => job.event_code === state.currentEvent.event_code);
 }
 
+function activeJobsForEvent() {
+  return jobsForEvent().filter((job) => job && AUTO_QUEUE_ACTIVE_STATUSES.has(job.status));
+}
+
 function jobsForMatch(match) {
   return jobsForEvent().filter((job) => job.match_label === match.label);
 }
 
+function storedArtifactForMatch(match) {
+  if (!match) {
+    return null;
+  }
+  const matchSlug = slugify(match.label);
+  return (state.storedArtifacts || []).find((artifact) => artifact.match_slug === matchSlug) || null;
+}
+
 function latestJobForMatch(match) {
   const jobs = jobsForMatch(match);
-  return jobs.length ? jobs[0] : null;
+  const activeJob = jobs.find((job) => job && AUTO_QUEUE_ACTIVE_STATUSES.has(job.status));
+  if (activeJob) {
+    return activeJob;
+  }
+  const completedJob = jobs.find((job) => job && job.status === "completed");
+  if (completedJob) {
+    return completedJob;
+  }
+  const artifact = storedArtifactForMatch(match);
+  if (!artifact) {
+    return jobs.length ? jobs[0] : null;
+  }
+  return {
+    job_id: `stored-${artifact.match_slug}`,
+    status: "completed",
+    return_code: 0,
+    output_dir: artifact.output_dir,
+    csv_workspace_url: artifact.csv_workspace_url,
+    jlog_workspace_url: artifact.jlog_workspace_url,
+    wpilog_workspace_url: artifact.wpilog_workspace_url,
+    workspace_output_url: artifact.workspace_output_url,
+    latest_preview_url: artifact.latest_preview_url,
+    latest_preview_path: artifact.latest_preview_path,
+    debug_frames_count: artifact.debug_frames_count || 0,
+    log_tail: [],
+    process_stages: [],
+    started_at: null,
+    finished_at: artifact.modified_at || null,
+    created_at: artifact.modified_at || null,
+    source_workspace_url: null,
+    downloaded_video_workspace_url: null,
+  };
+}
+
+function latestJobLabel(job) {
+  if (!job) {
+    return "None";
+  }
+  if (String(job.job_id || "").startsWith("stored-")) {
+    return "Stored output";
+  }
+  return job.job_id + (job.return_code != null ? ` • rc ${job.return_code}` : "");
+}
+
+function autoQueueEligibleMatches() {
+  return currentQualificationMatches().filter((match) => match.video_url && !latestJobForMatch(match));
 }
 
 function matchStatusMeta(match) {
@@ -1317,10 +1618,13 @@ function matchStatusMeta(match) {
     };
   }
   if (job && job.status === "completed") {
+    const storedOnly = String(job.job_id || "").startsWith("stored-");
     return {
       label: "Processed",
       className: "processed",
-      detail: `Completed job ${job.job_id}${job.output_dir ? ` • ${job.output_dir}` : ""}`,
+      detail: storedOnly
+        ? `Stored output found${job.output_dir ? ` • ${job.output_dir}` : ""}`
+        : `Completed job ${job.job_id}${job.output_dir ? ` • ${job.output_dir}` : ""}`,
     };
   }
   return {
@@ -1505,12 +1809,385 @@ function isJobActive(job) {
   return Boolean(job && (job.status === "running" || job.status === "stopping"));
 }
 
+function handleAutoQueueJobUpdates(previousJobs, nextJobs) {
+  if (!state.autoQueueEnabled) {
+    return;
+  }
+  const previousJobsById = new Map((previousJobs || []).map((job) => [job.job_id, job]));
+  for (const job of nextJobs || []) {
+    if (!job || !job.job_id || !jobIndicatesRateLimit(job)) {
+      continue;
+    }
+    if (state.autoQueueHandledRateLimitedJobIds.includes(job.job_id)) {
+      continue;
+    }
+    const previousStatus = previousJobsById.get(job.job_id)?.status || null;
+    const isNowTerminal = AUTO_QUEUE_TERMINAL_STATUSES.has(job.status);
+    const wasPreviouslyTerminal = previousStatus ? AUTO_QUEUE_TERMINAL_STATUSES.has(previousStatus) : false;
+    if (!isNowTerminal || wasPreviouslyTerminal) {
+      continue;
+    }
+    state.autoQueueHandledRateLimitedJobIds.push(job.job_id);
+    if (state.autoQueueHandledRateLimitedJobIds.length > 60) {
+      state.autoQueueHandledRateLimitedJobIds = state.autoQueueHandledRateLimitedJobIds.slice(-30);
+    }
+    applyAutoQueueRateLimit();
+  }
+}
+
+function applyAutoQueueRateLimit() {
+  const now = Date.now();
+  if (!state.autoQueueLast429At || (now - state.autoQueueLast429At) > AUTO_QUEUE_RATE_LIMIT_RESET_MS) {
+    state.autoQueueConsecutive429s = 0;
+  }
+  state.autoQueueConsecutive429s += 1;
+  state.autoQueueLast429At = now;
+  const cooldownMs = Math.min(
+    AUTO_QUEUE_RATE_LIMIT_MAX_COOLDOWN_MS,
+    AUTO_QUEUE_RATE_LIMIT_BASE_COOLDOWN_MS * (2 ** Math.max(0, state.autoQueueConsecutive429s - 1)),
+  );
+  state.autoQueueCooldownUntil = Math.max(state.autoQueueCooldownUntil, now + cooldownMs);
+}
+
+function jobIndicatesRateLimit(job) {
+  const joinedOutput = normalizedJobOutput(job);
+  return joinedOutput.includes("http error 429")
+    || joinedOutput.includes("too many requests")
+    || joinedOutput.includes("rate-limiting this machine")
+    || joinedOutput.includes("rate limit");
+}
+
+function normalizedJobOutput(job) {
+  if (!job || !Array.isArray(job.log_tail) || !job.log_tail.length) {
+    return "";
+  }
+  return job.log_tail.join("\n").toLowerCase();
+}
+
+function hasActiveLoadingFootageJob() {
+  return activeJobsForEvent().some((job) => {
+    const loadingStage = stageForJob(job, "Loading Match Footage");
+    if (!loadingStage) {
+      return true;
+    }
+    return loadingStage.status !== "completed" && loadingStage.status !== "failed";
+  });
+}
+
+function stageForJob(job, stageName) {
+  if (!job || !Array.isArray(job.process_stages)) {
+    return null;
+  }
+  return job.process_stages.find((stage) => stage.name === stageName) || null;
+}
+
+function eventCompletedJobDurationsMs() {
+  return jobsForEvent()
+    .filter((job) => job.status === "completed")
+    .map((job) => {
+      const startedAt = Number(job.started_at || 0);
+      const finishedAt = Number(job.finished_at || 0);
+      if (!(startedAt > 0) || !(finishedAt > startedAt)) {
+        return null;
+      }
+      const durationMs = (finishedAt - startedAt) * 1000;
+      return durationMs >= 30 * 1000 && durationMs <= 2 * 60 * 60 * 1000 ? durationMs : null;
+    })
+    .filter((value) => Number.isFinite(value));
+}
+
+function medianDurationMs(values) {
+  const sorted = (values || [])
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (!sorted.length) {
+    return null;
+  }
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[middle];
+  }
+  return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function estimatedTotalBaselineJobDurationMs() {
+  return medianDurationMs(eventCompletedJobDurationsMs()) || DEFAULT_JOB_DURATION_MS;
+}
+
+function elapsedJobDurationMs(job) {
+  if (!job || !job.started_at) {
+    return 0;
+  }
+  const endTimeSeconds = job.finished_at || (Date.now() / 1000);
+  return Math.max(0, (endTimeSeconds - Number(job.started_at)) * 1000);
+}
+
+function completedStageDurationsMs(stageName) {
+  return jobsForEvent()
+    .filter((job) => job.status === "completed")
+    .map((job) => {
+      const stage = stageForJob(job, stageName);
+      const startedAt = Number(stage?.stage_started_at || 0);
+      const completedAt = Number(stage?.stage_completed_at || 0);
+      if (!(startedAt > 0) || !(completedAt > startedAt)) {
+        return null;
+      }
+      const durationMs = (completedAt - startedAt) * 1000;
+      return durationMs >= 1000 && durationMs <= 2 * 60 * 60 * 1000 ? durationMs : null;
+    })
+    .filter((value) => Number.isFinite(value));
+}
+
+function estimatedStageDurationMs(stageName, totalBaselineDurationMs = estimatedTotalBaselineJobDurationMs()) {
+  const sampleMedian = medianDurationMs(completedStageDurationsMs(stageName));
+  if (sampleMedian != null) {
+    return sampleMedian;
+  }
+  const fallbackWeight = Number(PROCESS_STAGE_WEIGHTS[stageName] || 0);
+  if (fallbackWeight > 0) {
+    return totalBaselineDurationMs * fallbackWeight;
+  }
+  return totalBaselineDurationMs / Math.max(PROCESS_STAGE_NAMES.length, 1);
+}
+
+function stageElapsedMs(stage) {
+  if (!stage || !stage.stage_started_at) {
+    return 0;
+  }
+  const endTimeSeconds = stage.stage_completed_at || (Date.now() / 1000);
+  return Math.max(0, (endTimeSeconds - Number(stage.stage_started_at)) * 1000);
+}
+
+function estimatedRemainingMsForInProgressStage(stage, stageBaselineMs) {
+  const elapsedMs = stageElapsedMs(stage);
+  const fraction = Number(stage?.progress_fraction);
+  if (Number.isFinite(fraction) && fraction > 0.03) {
+    const projectedStageTotalMs = Math.max(stageBaselineMs, elapsedMs / clamp(fraction, 0.03, 1));
+    return Math.max(0, projectedStageTotalMs - elapsedMs);
+  }
+  const bufferedStageTotalMs = Math.max(stageBaselineMs, elapsedMs * 1.15 + 15000);
+  return Math.max(0, bufferedStageTotalMs - elapsedMs);
+}
+
+function estimatedJobRemainingMs(job, totalBaselineDurationMs = estimatedTotalBaselineJobDurationMs()) {
+  if (!job) {
+    return totalBaselineDurationMs;
+  }
+  if (job.status === "completed") {
+    return 0;
+  }
+  if (job.status === "failed" || job.status === "cancelled") {
+    return null;
+  }
+  if (job.status === "queued") {
+    return totalBaselineDurationMs;
+  }
+
+  let remainingMs = 0;
+  let sawKnownStage = false;
+  for (const stageName of PROCESS_STAGE_NAMES) {
+    const stage = stageForJob(job, stageName);
+    const stageBaselineMs = estimatedStageDurationMs(stageName, totalBaselineDurationMs);
+    if (!stage) {
+      remainingMs += stageBaselineMs;
+      continue;
+    }
+    if (stage.status === "completed") {
+      sawKnownStage = true;
+      continue;
+    }
+    if (stage.status === "in_progress") {
+      sawKnownStage = true;
+      remainingMs += estimatedRemainingMsForInProgressStage(stage, stageBaselineMs);
+      const stageIndex = PROCESS_STAGE_NAMES.indexOf(stageName);
+      for (let index = stageIndex + 1; index < PROCESS_STAGE_NAMES.length; index += 1) {
+        remainingMs += estimatedStageDurationMs(PROCESS_STAGE_NAMES[index], totalBaselineDurationMs);
+      }
+      return Math.max(0, remainingMs);
+    }
+    if (stage.status === "pending") {
+      sawKnownStage = true;
+      remainingMs += stageBaselineMs;
+      continue;
+    }
+    if (stage.status === "failed" || stage.status === "cancelled") {
+      return null;
+    }
+  }
+
+  if (sawKnownStage) {
+    return Math.max(0, remainingMs);
+  }
+  return Math.max(0, totalBaselineDurationMs - elapsedJobDurationMs(job));
+}
+
+function buildProcessEstimateText(match, job) {
+  const baselineDurationMs = estimatedTotalBaselineJobDurationMs();
+  if (!match?.video_url) {
+    return "Waiting for clip";
+  }
+  if (!job) {
+    return `${formatDurationWords(baselineDurationMs)} if started now`;
+  }
+  if (job.status === "completed") {
+    return "Completed";
+  }
+  if (job.status === "failed") {
+    return "Retry needed";
+  }
+  if (job.status === "cancelled") {
+    return "Stopped early";
+  }
+  if (job.status === "stopping") {
+    return "Stopping...";
+  }
+  const remainingMs = estimatedJobRemainingMs(job, baselineDurationMs);
+  if (remainingMs == null) {
+    return "Estimating...";
+  }
+  if (remainingMs <= 15 * 1000) {
+    return "Under 15s left";
+  }
+  return `${formatDurationWords(remainingMs)} left`;
+}
+
+function buildOverviewEstimateText() {
+  const estimate = estimatedOverviewCompletion();
+  if (!estimate.hasWork) {
+    return "No queued or active work to estimate yet.";
+  }
+  const finishLabel = estimate.finishAtMs ? `around ${formatClockTime(estimate.finishAtMs)}` : "when started";
+  return `Estimated queued completion: ${formatDurationWords(estimate.remainingMs)} remaining, finishing ${finishLabel}.`;
+}
+
+function estimatedOverviewCompletion() {
+  const baselineDurationMs = estimatedTotalBaselineJobDurationMs();
+  const activeJobs = activeJobsForEvent();
+  const queuedMatches = autoQueueEligibleMatches();
+  if (!activeJobs.length && !queuedMatches.length) {
+    return { hasWork: false, remainingMs: 0, finishAtMs: null };
+  }
+
+  const laneCount = Math.max(1, normalizedParallelTrackJobs(), activeJobs.length);
+  const laneAvailableAt = new Array(laneCount).fill(0);
+  const activeRemaining = activeJobs
+    .map((job) => estimatedJobRemainingMs(job, baselineDurationMs))
+    .map((value) => (value == null ? baselineDurationMs : value))
+    .sort((a, b) => b - a);
+
+  for (let index = 0; index < activeRemaining.length; index += 1) {
+    laneAvailableAt[index] = activeRemaining[index];
+  }
+
+  let nextLaunchDelayMs = Math.max(0, state.autoQueueCooldownUntil - Date.now());
+  for (let index = 0; index < queuedMatches.length; index += 1) {
+    laneAvailableAt.sort((a, b) => a - b);
+    const startAtMs = Math.max(laneAvailableAt[0], nextLaunchDelayMs);
+    laneAvailableAt[0] = startAtMs + baselineDurationMs;
+    nextLaunchDelayMs = 0;
+  }
+
+  const remainingMs = Math.max(...laneAvailableAt, 0);
+  return {
+    hasWork: true,
+    remainingMs,
+    finishAtMs: Date.now() + remainingMs,
+  };
+}
+
+function normalizedParallelTrackJobs() {
+  const override = state.settings?.parallel_track_jobs_override;
+  if (override !== null && override !== undefined && override !== "") {
+    return Math.max(1, Number(override));
+  }
+  return Math.max(1, Number(state.hardware?.recommendations?.recommended_parallel_track_jobs ?? 1));
+}
+
 function normalizedScrapeWorkers() {
   const override = state.settings?.scrape_workers_override;
   if (override !== null && override !== undefined && override !== "") {
     return Number(override);
   }
   return state.hardware?.recommendations?.recommended_scrape_workers;
+}
+
+function toggleGlobalQueue() {
+  state.autoQueueEnabled = !state.autoQueueEnabled;
+  if (!state.autoQueueEnabled) {
+    state.autoQueueLastDiscoverAt = 0;
+    state.autoQueueCooldownUntil = 0;
+    state.autoQueueConsecutive429s = 0;
+    state.autoQueueLast429At = 0;
+  }
+  saveDashboardState();
+  renderOverview();
+  if (state.autoQueueEnabled) {
+    void maybeRunAutoQueue();
+  }
+}
+
+async function maybeRunAutoQueue() {
+  if (!state.autoQueueEnabled || !state.currentEvent || state.autoQueueTickInFlight) {
+    return;
+  }
+  state.autoQueueTickInFlight = true;
+  try {
+    if (state.autoQueueCooldownUntil && Date.now() >= state.autoQueueCooldownUntil) {
+      state.autoQueueCooldownUntil = 0;
+    }
+    const parallelLimit = normalizedParallelTrackJobs();
+    const activeJobs = activeJobsForEvent().length;
+    const openSlots = Math.max(0, parallelLimit - activeJobs);
+    const readyMatches = autoQueueEligibleMatches();
+    const coolingDown = state.autoQueueCooldownUntil > Date.now();
+    if (!coolingDown && openSlots > 0 && readyMatches.length > 0 && !hasActiveLoadingFootageJob()) {
+      try {
+        await startMatchProcessing(readyMatches[0], { focusMatch: false, openProcessView: false });
+      } catch (_error) {
+        // Let normal job polling decide whether this was a transient startup issue or a real 429 failure.
+      }
+      return;
+    }
+    if (readyMatches.length === 0 && shouldAutoRefreshEventDiscovery()) {
+      await autoRefreshCurrentEvent();
+    }
+  } finally {
+    state.autoQueueTickInFlight = false;
+    if (state.route === "overview") {
+      renderOverview();
+    }
+  }
+}
+
+function shouldAutoRefreshEventDiscovery() {
+  if (!state.currentEvent || state.isLoadingEvent || state.autoQueueDiscoverInFlight) {
+    return false;
+  }
+  const hasUpcomingMatches = currentQualificationMatches().some((match) => matchStatusMeta(match).label === "Upcoming");
+  if (!hasUpcomingMatches) {
+    return false;
+  }
+  return (Date.now() - state.autoQueueLastDiscoverAt) >= AUTO_QUEUE_DISCOVERY_INTERVAL_MS;
+}
+
+async function autoRefreshCurrentEvent() {
+  if (!state.currentEvent || state.autoQueueDiscoverInFlight) {
+    return;
+  }
+  state.autoQueueDiscoverInFlight = true;
+  state.autoQueueLastDiscoverAt = Date.now();
+  try {
+    const payload = await apiPost("/api/event/discover", {
+      season: state.currentEvent.season,
+      event_code: state.currentEvent.event_code,
+      io_workers: normalizedScrapeWorkers(),
+    });
+    showEventWorkspace(payload, true);
+  } catch (_error) {
+    // Keep the current event snapshot if background discovery fails.
+  } finally {
+    state.autoQueueDiscoverInFlight = false;
+  }
 }
 
 function extractMatchNumber(label) {
@@ -1602,6 +2279,43 @@ function safeParse(value) {
     return JSON.parse(value);
   } catch (_error) {
     return null;
+  }
+}
+
+function formatDurationShort(valueMs) {
+  const totalSeconds = Math.max(1, Math.ceil(Number(valueMs || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes <= 0) {
+    return `${seconds}s`;
+  }
+  if (seconds === 0) {
+    return `${minutes}m`;
+  }
+  return `${minutes}m ${seconds}s`;
+}
+
+function formatDurationWords(valueMs) {
+  const totalMinutes = Math.max(1, Math.round(Number(valueMs || 0) / 60000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours <= 0) {
+    return `${totalMinutes}m`;
+  }
+  if (minutes === 0) {
+    return `${hours}h`;
+  }
+  return `${hours}h ${minutes}m`;
+}
+
+function formatClockTime(timestampMs) {
+  try {
+    return new Date(timestampMs).toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  } catch (_error) {
+    return "";
   }
 }
 

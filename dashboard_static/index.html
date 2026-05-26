@@ -27,7 +27,7 @@
 
       <div class="topbar-status">
         <div class="status-chip">
-          <span>Dashboard</span>
+          <span>STATUS</span>
           <strong id="healthLabel">Starting...</strong>
         </div>
         <div class="status-chip hidden" id="progressNudge">
@@ -95,6 +95,17 @@
                 <h2 id="eventTitle">Event Overview</h2>
               </div>
               <button type="button" id="reloadEventButton">Reload Event</button>
+            </div>
+            <div class="queue-card">
+              <div class="queue-copy">
+                <div class="section-title">Global Queue</div>
+                <h3 id="globalQueueTitle">Automatic processing is idle</h3>
+                <div class="job-meta" id="globalQueueMeta">Starts ready matches up to the recommended machine parallelism.</div>
+                <div class="job-meta" id="globalQueueEstimate">No queued work yet.</div>
+              </div>
+              <div class="inline-actions">
+                <button type="button" id="globalStartButton" class="primary">Start All</button>
+              </div>
             </div>
             <div class="match-list scroll-list" id="matchList"></div>
           </article>

@@ -61,6 +61,12 @@ For Python changes, at minimum:
 python3 -m py_compile auto_scout.py dashboard_server.py autoscout/*.py util/juice_log.py tools/calibrate.py tools/debug.py
 ```
 
+For dashboard JavaScript changes, also run:
+
+```bash
+node --check dashboard_static/app.js
+```
+
 If your change affects tracking, calibration, or exports, also do a realistic manual check when possible:
 
 - run `auto_scout.py` on a local example video
@@ -68,6 +74,7 @@ If your change affects tracking, calibration, or exports, also do a realistic ma
 - check any affected debug output
 - open the browser tools if you changed their UI or data flow
 - start `dashboard_server.py` and verify the relevant API or UI path if you changed dashboard behavior
+- if you changed queueing, process view, calibration, or dashboard settings behavior, verify the matching browser flow directly
 
 In your PR description, mention what you validated and what you did not validate.
 

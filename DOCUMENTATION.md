@@ -7,7 +7,7 @@ This repository tracks the four robots in an FTC match video, projects them into
 
 1. Calibrate the field corners in the video.
 2. Run the automatic tracker on the calibrated video.
-3. Inspect the CSV, JLOG, WPILOG, background image, and optional debug frames.
+3. Inspect the CSV, JLOG, WPILOG, background image, live dashboard previews, and optional debug media.
 4. If needed, produce supervised manual labels with the browser-based manual tracker and reuse them to tune identity assignment.
 
 The repo currently contains several user-facing tools:
@@ -166,7 +166,7 @@ This uses the manual labels to build per-robot appearance histograms that help i
 Start the dashboard:
 
 ```bash
-python3 dashboard_server.py
+python3 dashboard_server.py --host 127.0.0.1 --port 8765
 ```
 
 Then open:
@@ -177,11 +177,12 @@ http://127.0.0.1:8765/
 
 The dashboard combines several workflows in one place:
 
-1. Scrape an FTC Events page by entering a season and event code, or a full FTC Events URL.
-2. Review discovered match pages and any YouTube links the scraper can infer.
-3. Inspect the local machine profile and recommended concurrency values.
-4. Launch tracker jobs that call the existing `auto_scout.py` CLI in the background.
-5. Generate `field_corners.json` directly in the browser from a local video frame.
+1. Load an FTC event by season and event code.
+2. Review qualification matches, alliance metadata, current processing state, and estimated completion time.
+3. Start one match manually from the process view or let the overview `Global Queue` keep the event moving automatically.
+4. Inspect live process output, stage progress, preview frames, and the embedded visualizer for completed jobs.
+5. Generate `field_corners.json` directly in the browser from a local file, a queued YouTube clip, an example video, or a still-cached match download.
+6. Tune dashboard defaults such as output root, debug cadence, yt-dlp auth settings, and concurrency overrides.
 
 Example FTC Events reference:
 
@@ -218,9 +219,10 @@ Most implementation details now live in `autoscout/`.
 It provides a browser dashboard for:
 
 - FTC Events discovery
-- heuristic YouTube-link scraping
+- heuristic YouTube-link scraping and match metadata extraction
 - machine diagnostics and concurrency suggestions
-- background tracker-job launching
+- background tracker-job launching and live monitoring
+- event-wide queue orchestration with hardware-aware concurrency limits
 - browser-based corner calibration
 
 ### Launch
@@ -246,11 +248,18 @@ Current dashboard endpoints include:
 - `GET /api/health`: basic liveness check.
 - `GET /api/hardware`: current hardware profile and recommendations.
 - `GET /api/hardware/refresh`: recompute the hardware profile.
+- `GET /api/usage`: current runtime CPU, memory, load-average, and network snapshot.
+- `GET /api/settings`: current dashboard settings.
 - `GET /api/examples`: local example videos and default corners path.
+- `GET /api/event/downloads?event_code=...`: list currently cached match downloads for one event.
 - `POST /api/event/discover`: scrape an FTC Events event by season/code or full URL.
 - `POST /api/jobs/start-track`: launch a background `auto_scout.py` process.
 - `GET /api/jobs`: list running and completed jobs.
 - `GET /api/jobs/<job_id>`: inspect one job.
+- `GET /api/jobs/<job_id>/preview`: fetch the latest streamed preview frame or preview video asset.
+- `POST /api/jobs/<job_id>/stop`: request a graceful stop for a running job.
+- `POST /api/resolve-video-source`: resolve a calibration/playback source from either a workspace file or a YouTube URL.
+- `POST /api/settings`: update dashboard settings.
 - `POST /api/save-corners`: write browser-calibrated corners JSON into the repo workspace.
 
 ### FTC Events scraping behavior
@@ -274,15 +283,56 @@ The dashboard does not rewrite tracker internals at runtime, but it does compute
 
 These values are used as guidance for the dashboard agent and as defaults when it launches background tracker processes.
 
+### Overview and queue behavior
+
+The overview page is the event control surface.
+
+- qualification matches are shown with per-match status, alliance team numbers, and scores when the source page exposes them
+- clicking a team number highlights every qualification match involving that team
+- the `Global Queue` can automatically keep starting ready matches while respecting the configured or recommended parallel-job limit
+- the queue intentionally staggers YouTube download starts so only one job is actively entering `Loading Match Footage` at a time
+- if YouTube responds with HTTP 429 or other rate-limit output, the queue enters a cooldown window and then resumes automatically
+- the overview also shows an event-wide completion estimate for the currently active and queued ready matches
+
+The queue only auto-starts matches that have a discoverable video link and no prior job yet. Failed and manually stopped matches remain available for manual retry from the process view.
+
+### Process view
+
+The process view is a per-match control panel.
+
+- `Start Processing` launches a new background `auto_scout.py` job for that match
+- `Stop Process` sends a terminate request and marks the job as stopping until the process exits
+- the preview panel shows either the latest streamed debug frame or the latest debug video asset
+- the checklist mirrors the four dashboard pipeline stages:
+  `Loading Match Footage`, `Calibrating Trackers`, `Tracking Match`, and `Cleaning Up`
+- the terminal panel shows the recent combined stdout/stderr tail from the running process
+- the integrated visualizer automatically embeds `tools/data_visualizer.html` when a finished job has CSV or JLOG output
+- the stats panel includes status, phase, source availability, latest job id/return code, estimated time remaining, and a clickable output directory path
+
+The process ETA is stage-aware. It uses live stage progress when available and historical stage durations from completed jobs when enough recent samples exist.
+
 ### Browser calibration tool
 
 The calibration panel inside the dashboard:
 
-- loads a local video directly in the browser
+- loads a selected video directly in the browser
 - lets the user scrub to a representative frame
 - allows draggable `TL`, `TR`, `BR`, and `BL` corner markers
+- can resolve a playable source from example videos, prior job source videos, still-cached downloaded match videos, queued YouTube clips, or an uploaded local file
 - exports JSON in the same `{"corners_px": [[bl], [br], [tr], [tl]]}` format the CLI expects
 - can optionally save that JSON into the repo workspace through `POST /api/save-corners`
+
+### Settings panel
+
+The settings panel controls dashboard defaults for future jobs:
+
+- FTC Events scrape worker override
+- parallel tracker job override
+- dashboard output root, defaulting to `./output_dashboard`
+- default debug frame cadence
+- default `--debug` and `--debug-video` behavior
+- automatic process-view navigation after job start
+- yt-dlp cookies file path and extractor args overrides for both downloads and browser-playable URL resolution
 
 ## CLI
 
@@ -325,6 +375,14 @@ Each run writes:
 - `median_background.jpg`: median background used for subtraction.
 - `tracker_debug/`: optional annotated frames when `--debug` is enabled.
 - `tracker_debug.mp4`: optional annotated debug video when `--debug-video` is enabled.
+
+When a job is launched from the dashboard, outputs are typically placed under:
+
+- `<output_root>/<EVENT_CODE>/<match_slug>/`
+
+where `output_root` defaults to `./output_dashboard`.
+
+Dashboard YouTube jobs may also create a temporary `match_video.mp4` download inside that match directory while the tracker is running. If the job completes successfully, the dashboard deletes that cached download after processing. If the job fails or is stopped before completion, the downloaded video is left in place so it can still be inspected, calibrated against, or reused manually.
 
 `robot_positions.csv` and `robot_positions.jlog` now also carry shot events:
 

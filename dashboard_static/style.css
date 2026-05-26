@@ -115,8 +115,9 @@ input[type="range"] {
 }
 
 .topbar {
-  display: grid;
-  grid-template-columns: minmax(240px, auto) 1fr auto;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
   gap: 12px;
   align-items: center;
   padding: 10px 12px;
@@ -130,6 +131,7 @@ input[type="range"] {
   grid-template-columns: 112px minmax(0, 1fr);
   gap: 12px;
   align-items: center;
+  flex: 1 1 320px;
   min-width: 0;
 }
 
@@ -145,9 +147,9 @@ input[type="range"] {
   font-weight: 800;
   line-height: 1.05;
   color: var(--accent-2);
-  white-space: nowrap;
   text-transform: uppercase;
   letter-spacing: .08em;
+  overflow-wrap: anywhere;
 }
 
 .brand-subtitle {
@@ -155,12 +157,16 @@ input[type="range"] {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.1;
+  overflow-wrap: anywhere;
 }
 
 .nav {
   display: flex;
   justify-content: center;
+  flex: 1 1 220px;
+  flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
 }
 
 .nav-btn.active {
@@ -170,9 +176,13 @@ input[type="range"] {
 }
 
 .topbar-status {
-  display: grid;
-  justify-items: end;
+  display: flex;
+  align-items: center;
+  justify-content: end;
+  flex-wrap: wrap;
+  flex: 1 1 320px;
   gap: 8px;
+  min-width: 0;
 }
 
 .status-chip {
@@ -180,7 +190,8 @@ input[type="range"] {
   border-radius: 10px;
   background: var(--panel);
   padding: 8px 10px;
-  min-width: 240px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .status-chip span {
@@ -200,7 +211,9 @@ input[type="range"] {
   display: flex;
   gap: 4px;
   height: 7px;
-  margin-bottom: 8px;
+  margin-bottom: 9px;
+  min-width: 120px;
+  flex: 0 0 120px;
 }
 
 .seg {
@@ -228,6 +241,17 @@ input[type="range"] {
 .nudge-label {
   color: var(--muted);
   font-size: 11px;
+}
+
+#progressNudge {
+  display: block;
+  min-width: 280px;
+  max-width: min(100%, 420px);
+  flex: 1 1 320px;
+}
+
+#progressNudge.status-chip {
+  justify-content: center;
 }
 
 .page-shell {
@@ -431,6 +455,29 @@ label {
   padding: 9px 10px;
 }
 
+.queue-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.queue-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.queue-copy h3 {
+  margin: 8px 0 0;
+  font-size: 16px;
+}
+
+.queue-copy .job-meta {
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
 .match-item.team-highlighted {
   border-color: rgba(255, 210, 79, 0.48);
   background: linear-gradient(180deg, rgba(255, 210, 79, 0.08), rgba(255, 255, 255, 0.02));
@@ -590,6 +637,55 @@ label {
   display: block;
   margin-top: 6px;
   font-size: 20px;
+}
+
+.stat-card-path {
+  min-width: 0;
+}
+
+.stat-path-btn {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 0;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  overflow: hidden;
+}
+
+.stat-path-btn:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+.stat-path-btn::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 56px;
+  height: 100%;
+  background: linear-gradient(90deg, rgba(19, 17, 20, 0), rgba(19, 17, 20, 0.86) 65%, rgba(19, 17, 20, 1));
+  pointer-events: none;
+}
+
+.stat-path-btn.copied::after {
+  display: none;
+}
+
+.stat-path-text {
+  display: block;
+  padding-right: 48px;
+  font-size: 20px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
 }
 
 .process-main {
@@ -778,6 +874,13 @@ label {
   line-height: 1.45;
 }
 
+#processLogs {
+  height: 320px;
+  min-height: 320px;
+  max-height: 320px;
+  overflow: auto;
+}
+
 .process-checklist {
   display: grid;
   gap: 10px;
@@ -958,7 +1061,6 @@ label {
 }
 
 @media (max-width: 1100px) {
-  .topbar,
   .dashboard-grid,
   .process-grid,
   .calibration-layout,
@@ -971,11 +1073,11 @@ label {
   }
 
   .topbar {
-    grid-template-columns: 1fr;
+    justify-content: start;
   }
 
   .topbar-status {
-    justify-items: start;
+    justify-content: start;
   }
 
   .alliance-stack {
@@ -986,6 +1088,11 @@ label {
 @media (max-width: 760px) {
   .brand {
     grid-template-columns: 1fr;
+  }
+
+  #progressNudge {
+    min-width: 0;
+    width: 100%;
   }
 
   .event-form,
@@ -1001,6 +1108,11 @@ label {
 
   .match-subtle {
     flex-basis: 100%;
+  }
+
+  .queue-card {
+    align-items: start;
+    flex-wrap: wrap;
   }
 }
 

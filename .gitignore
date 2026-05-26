@@ -6,3 +6,4 @@ __pycache__
 AUTOSCOUT_PAPER.tex
 field_corners.json
 changelog.py
+auto_scout_old.py

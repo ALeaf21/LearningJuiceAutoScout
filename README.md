@@ -65,18 +65,20 @@ python3 auto_scout.py "https://www.youtube.com/watch?v=..."
 Start the local dashboard:
 
 ```bash
-python3 dashboard_server.py
+python3 dashboard_server.py --host 127.0.0.1 --port 8765
 ```
 
 Then open `http://127.0.0.1:8765/` in a browser.
 
 The dashboard adds:
 
-- an FTC Events event agent that accepts a season plus event code, or a full FTC Events URL
-- heuristic scraping for match pages and attached YouTube links
-- local hardware inspection with concurrency recommendations
-- background tracker-job launching for the existing CLI
-- an in-browser field-corner calibration tool that exports `field_corners.json`
+- FTC Events event loading by season plus event code
+- qualification-match overview cards with alliance metadata, scores when available, and per-match status
+- a hardware-aware global queue that can keep starting ready matches automatically
+- local hardware inspection, runtime usage, and concurrency recommendations
+- background tracker-job launching, stopping, live previews, stage checklists, terminal output, and embedded data visualization
+- an in-browser field-corner calibration tool that can use uploaded files, queued YouTube clips, example videos, prior source videos, or still-cached match downloads
+- yt-dlp cookies and extractor-args settings for both downloads and browser-playable YouTube resolution
 
 ## CLI Flags
 | Flag | Type | Default | Description |
@@ -145,6 +147,14 @@ When a run finishes, the output directory typically contains:
   Optional annotated frames showing contours, split centers, merge annotations, and robot IDs.
 - `tracker_debug.mp4`
   Optional annotated debug video written when `--debug-video` is enabled.
+
+When a job is launched from the dashboard, outputs are typically placed under:
+
+- `<output_root>/<EVENT_CODE>/<match_slug>/`
+
+where `output_root` defaults to `./output_dashboard`.
+
+Dashboard YouTube jobs may also create a temporary `match_video.mp4` inside that match directory while the tracker is running. If the job completes successfully, the dashboard deletes that cached download after processing. If the job fails or is stopped before completion, the downloaded video is left in place so it can still be inspected, calibrated against, or reused manually.
 
 ## Debug Notes
 - `--debug-every` is based on processed-frame spacing. The default `1` saves every processed frame.

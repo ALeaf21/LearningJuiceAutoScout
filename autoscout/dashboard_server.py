@@ -47,6 +47,8 @@ def _initial_process_stages() -> Dict[str, Dict[str, object]]:
             "progress_current": None,
             "progress_total": None,
             "progress_fraction": None,
+            "stage_started_at": None,
+            "stage_completed_at": None,
         }
         for name in PROCESS_STAGE_ORDER
     }
@@ -107,7 +109,7 @@ class TrackJob:
 
 class DashboardState:
     def __init__(self, root_dir: Path):
-        self.root_dir = root_dir
+        self.root_dir = root_dir.resolve()
         self.jobs: Dict[str, TrackJob] = {}
         self.jobs_lock = threading.Lock()
         self.hardware_lock = threading.Lock()
@@ -195,11 +197,7 @@ class DashboardState:
         normalized_event_code = str(event_code or "").strip().upper()
         if not normalized_event_code:
             return {"event_code": "", "videos": []}
-        settings = self.get_settings()
-        output_root = Path(str(settings.get("output_root") or "./output_dashboard")).expanduser()
-        if not output_root.is_absolute():
-            output_root = (self.root_dir / output_root).resolve()
-        event_root = output_root / normalized_event_code
+        event_root = self._event_output_root(normalized_event_code)
         videos: List[Dict[str, object]] = []
         if event_root.exists():
             for video_path in sorted(event_root.glob("*/match_video.mp4")):
@@ -216,6 +214,23 @@ class DashboardState:
         return {
             "event_code": normalized_event_code,
             "videos": videos,
+        }
+
+    def list_event_artifacts(self, event_code: str) -> Dict[str, object]:
+        normalized_event_code = str(event_code or "").strip().upper()
+        if not normalized_event_code:
+            return {"event_code": "", "artifacts": []}
+        event_root = self._event_output_root(normalized_event_code)
+        artifacts: List[Dict[str, object]] = []
+        if event_root.exists():
+            for match_dir in sorted(path for path in event_root.iterdir() if path.is_dir()):
+                artifact = self._stored_match_artifact(match_dir)
+                if artifact is None:
+                    continue
+                artifacts.append(artifact)
+        return {
+            "event_code": normalized_event_code,
+            "artifacts": artifacts,
         }
 
     def save_corners(self, filename: str, corners_px: List[List[float]]) -> Dict[str, object]:
@@ -390,6 +405,8 @@ class DashboardState:
             if job.status == "failed":
                 self._fail_in_progress_stages(job, "Failed")
         job.logs.append("[DONE] Job finished with code {}".format(return_code))
+        if job.status == "completed":
+            self._delete_downloaded_video(Path(job.output_dir), job.logs)
 
     def list_jobs(self) -> List[Dict[str, object]]:
         with self.jobs_lock:
@@ -454,13 +471,50 @@ class DashboardState:
             payload["latest_preview_url"] = "/api/jobs/{}/preview?ts={}".format(job.job_id, ts_value)
         return payload
 
+    def _event_output_root(self, normalized_event_code: str) -> Path:
+        settings = self.get_settings()
+        output_root = Path(str(settings.get("output_root") or "./output_dashboard")).expanduser()
+        if not output_root.is_absolute():
+            output_root = (self.root_dir / output_root).resolve()
+        return output_root / normalized_event_code
+
+    def _stored_match_artifact(self, match_dir: Path) -> Optional[Dict[str, object]]:
+        csv_path = match_dir / "robot_positions.csv"
+        jlog_path = match_dir / "robot_positions.jlog"
+        wpilog_path = match_dir / "match_log.wpilog"
+        if not csv_path.exists() and not jlog_path.exists() and not wpilog_path.exists():
+            return None
+        preview_path = self._latest_preview_path_for_output_dir(match_dir)
+        preview_workspace_url = self._workspace_url(preview_path) if preview_path else None
+        preview_frames_count = 0
+        debug_dir = match_dir / "tracker_debug"
+        if debug_dir.exists():
+            preview_frames_count = len(list(debug_dir.glob("*.jpg")))
+        modified_candidates = [path for path in [csv_path, jlog_path, wpilog_path, preview_path] if path and path.exists()]
+        modified_at = max((path.stat().st_mtime for path in modified_candidates), default=match_dir.stat().st_mtime)
+        return {
+            "match_slug": match_dir.name,
+            "output_dir": str(match_dir),
+            "workspace_output_url": self._workspace_url(match_dir),
+            "csv_workspace_url": self._workspace_url(csv_path) if csv_path.exists() else None,
+            "jlog_workspace_url": self._workspace_url(jlog_path) if jlog_path.exists() else None,
+            "wpilog_workspace_url": self._workspace_url(wpilog_path) if wpilog_path.exists() else None,
+            "latest_preview_url": preview_workspace_url,
+            "latest_preview_path": str(preview_path) if preview_path else None,
+            "debug_frames_count": preview_frames_count,
+            "modified_at": modified_at,
+        }
+
     def _latest_preview_path(self, job: TrackJob) -> Optional[Path]:
-        debug_dir = Path(job.output_dir) / "tracker_debug"
+        return self._latest_preview_path_for_output_dir(Path(job.output_dir))
+
+    def _latest_preview_path_for_output_dir(self, output_dir: Path) -> Optional[Path]:
+        debug_dir = output_dir / "tracker_debug"
         if debug_dir.exists():
             frames = sorted(debug_dir.glob("*.jpg"))
             if frames:
                 return frames[-1]
-        debug_video = Path(job.output_dir) / "tracker_debug.mp4"
+        debug_video = output_dir / "tracker_debug.mp4"
         if debug_video.exists():
             return debug_video
         return None
@@ -481,19 +535,30 @@ class DashboardState:
         if kind == "stage":
             stage_name = str(payload.get("stage") or "")
             if stage_name in job.process_stages:
-                job.process_stages[stage_name]["status"] = str(payload.get("status") or "pending")
-                job.process_stages[stage_name]["detail"] = str(payload.get("detail") or "")
-                job.process_stages[stage_name]["progress_current"] = payload.get("progress_current")
-                job.process_stages[stage_name]["progress_total"] = payload.get("progress_total")
-                job.process_stages[stage_name]["progress_fraction"] = payload.get("progress_fraction")
-                if job.process_stages[stage_name]["status"] == "completed":
-                    job.process_stages[stage_name]["progress_current"] = 1
-                    job.process_stages[stage_name]["progress_total"] = 1
-                    job.process_stages[stage_name]["progress_fraction"] = 1.0
-                elif job.process_stages[stage_name]["status"] != "in_progress":
-                    job.process_stages[stage_name]["progress_current"] = None
-                    job.process_stages[stage_name]["progress_total"] = None
-                    job.process_stages[stage_name]["progress_fraction"] = None
+                stage = job.process_stages[stage_name]
+                previous_status = str(stage.get("status") or "pending")
+                next_status = str(payload.get("status") or "pending")
+                now = time.time()
+                if next_status == "in_progress" and previous_status != "in_progress":
+                    stage["stage_started_at"] = now
+                    stage["stage_completed_at"] = None
+                elif next_status == "completed":
+                    if stage.get("stage_started_at") is None:
+                        stage["stage_started_at"] = now
+                    stage["stage_completed_at"] = now
+                stage["status"] = next_status
+                stage["detail"] = str(payload.get("detail") or "")
+                stage["progress_current"] = payload.get("progress_current")
+                stage["progress_total"] = payload.get("progress_total")
+                stage["progress_fraction"] = payload.get("progress_fraction")
+                if stage["status"] == "completed":
+                    stage["progress_current"] = 1
+                    stage["progress_total"] = 1
+                    stage["progress_fraction"] = 1.0
+                elif stage["status"] != "in_progress":
+                    stage["progress_current"] = None
+                    stage["progress_total"] = None
+                    stage["progress_fraction"] = None
             return
         if kind == "preview":
             raw_b64 = payload.get("jpeg_b64")
@@ -524,15 +589,31 @@ class DashboardState:
             return None
         return "/workspace/" + str(rel).replace(os.sep, "/")
 
+    def _delete_downloaded_video(self, output_dir: Path, logs: deque) -> None:
+        video_path = output_dir / "match_video.mp4"
+        archive_path = output_dir / "match_video.mp4.xz"
+        removed_any = False
+        try:
+            if video_path.exists():
+                video_path.unlink()
+                removed_any = True
+            if archive_path.exists():
+                archive_path.unlink()
+                removed_any = True
+            if removed_any:
+                logs.append("[INFO] Deleted cached downloaded match video after successful processing.")
+        except OSError as exc:
+            logs.append("[WARN] Failed to delete downloaded match video: {}".format(exc))
+
 
 class DashboardHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, server_address, handler_class, root_dir: Path):
         super().__init__(server_address, handler_class)
-        self.root_dir = root_dir
-        self.static_dir = root_dir / "dashboard_static"
-        self.state = DashboardState(root_dir)
+        self.root_dir = root_dir.resolve()
+        self.static_dir = self.root_dir / "dashboard_static"
+        self.state = DashboardState(self.root_dir)
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -562,6 +643,10 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/event/downloads":
             event_code = parse_qs(parsed.query).get("event_code", [""])[0]
             self._write_json(self.server.state.list_downloaded_videos(event_code))
+            return
+        if path == "/api/event/artifacts":
+            event_code = parse_qs(parsed.query).get("event_code", [""])[0]
+            self._write_json(self.server.state.list_event_artifacts(event_code))
             return
         if path == "/api/jobs":
             self._write_json({"jobs": self.server.state.list_jobs()})
