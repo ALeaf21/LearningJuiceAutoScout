@@ -7,10 +7,9 @@
 
 *This project is developed by **Ray Enterprises' R&D** (ARED) for use by FTC Team Juice 16236.*
 
-<video width="640" height="480" controls>
-  <source src="assets/redacted side by side.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+
+https://github.com/user-attachments/assets/64045d5d-e12f-4a64-a7b1-fd415e46685a
+
 
 ## About AutoScout
 `auto_scout.py` is the tracker entrypoint for FTC match videos. It orchestrates the tracking pipeline, projects robots into field coordinates, and exports the result for later analysis.
