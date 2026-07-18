@@ -1,0 +1,8 @@
+{
+  "video": "examples/joosmatch.mp4",
+  "corners": "field_corners.json",
+  "cv_layers_frame": 2073,
+  "merge_debug_frame": 2247,
+  "cv_layers_image": "assets/paper/cv_layers_joosmatch.png",
+  "merge_debug_image": "assets/paper/merge_debug_joosmatch.png"
+}
