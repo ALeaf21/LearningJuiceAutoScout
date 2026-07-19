@@ -5,6 +5,7 @@
 AutoScout is a computer vision pipeline that automatically tracks four robots in FTC (FIRST Tech Challenge) match videos, detects shots, and exports structured data for analysis.
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TB
     Input["📹 Input<br/>Video File or YouTube URL"]
     Calibration["🔧 Field Calibration<br/>Auto-detect or Manual"]
@@ -20,11 +21,11 @@ graph TB
     Tracking -.->|Live Preview| Dashboard
     ShotDetection -.->|Live Preview| Dashboard
     
-    style Input fill:#e1f5ff
-    style Output fill:#c8e6c9
-    style Dashboard fill:#fff9c4
-    style Tracking fill:#f3e5f5
-    style ShotDetection fill:#f3e5f5
+    style Input fill:#0ea5e9,stroke:#06b6d4,stroke-width:3px,color:#000
+    style Output fill:#10b981,stroke:#059669,stroke-width:3px,color:#fff
+    style Dashboard fill:#f59e0b,stroke:#d97706,stroke-width:3px,color:#000
+    style Tracking fill:#8b5cf6,stroke:#7c3aed,stroke-width:3px,color:#fff
+    style ShotDetection fill:#8b5cf6,stroke:#7c3aed,stroke-width:3px,color:#fff
 ```
 
 ---
@@ -34,6 +35,7 @@ graph TB
 ### Core Tracking Package (`autoscout/`)
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph LR
     Main["auto_scout.py<br/>(Main Entry)"]
     
@@ -76,11 +78,11 @@ graph LR
     Main -.-> Dashboard
     Main -.-> Hardware
     
-    style Main fill:#ffd54f
-    style Core fill:#c8e6c9
-    style Export fill:#b3e5fc
-    style Utilities fill:#ffe0b2
-    style Integration fill:#d7ccc8
+    style Main fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
+    style Core fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Export fill:#0ea5e9,stroke:#06b6d4,stroke-width:2px,color:#000
+    style Utilities fill:#ec4899,stroke:#be185d,stroke-width:2px,color:#fff
+    style Integration fill:#6366f1,stroke:#4f46e5,stroke-width:2px,color:#fff
 ```
 
 ### Data Flow Through Pipeline
@@ -124,6 +126,7 @@ sequenceDiagram
 The system uses three coordinate frames with transformations between them:
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph LR
     User["User Input<br/>(Center-Origin)<br/>(-72, -72) to (72, 72) inches"]
     
@@ -137,10 +140,10 @@ graph LR
     Internal -->|-72| Output
     Output -->|*0.0254<br/>Swap Axes| WPILog
     
-    style User fill:#e3f2fd
-    style Internal fill:#f3e5f5
-    style Output fill:#c8e6c9
-    style WPILog fill:#fff3e0
+    style User fill:#0ea5e9,stroke:#06b6d4,stroke-width:2px,color:#000
+    style Internal fill:#8b5cf6,stroke:#7c3aed,stroke-width:2px,color:#fff
+    style Output fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style WPILog fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
 ```
 
 **Transformation Functions:**
@@ -153,6 +156,7 @@ graph LR
 ## Robot Tracking Algorithm
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TD
     Frame["Read Video Frame"]
     FG["Background Subtraction<br/>|frame - median_bg| > threshold"]
@@ -180,10 +184,10 @@ graph TD
     UpdateMerge --> UpdatePose
     UpdatePose --> Output
     
-    style Frame fill:#e1f5ff
-    style Output fill:#c8e6c9
-    style Assign fill:#f3e5f5
-    style UpdateMerge fill:#f3e5f5
+    style Frame fill:#0ea5e9,stroke:#06b6d4,stroke-width:2px,color:#000
+    style Output fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Assign fill:#8b5cf6,stroke:#7c3aed,stroke-width:2px,color:#fff
+    style UpdateMerge fill:#8b5cf6,stroke:#7c3aed,stroke-width:2px,color:#fff
 ```
 
 **Key Parameters:**
@@ -214,6 +218,7 @@ Cost Components:
 When multiple robots share a foreground blob (collision):
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TD
     Merge["Merge Started<br/>2+ tracks → 1 blob"]
     
@@ -233,10 +238,10 @@ graph TD
     Separate --> Resolve
     Resolve --> Reanchor
     
-    style Merge fill:#ffccbc
-    style Separate fill:#ffccbc
-    style Resolve fill:#c8e6c9
-    style Tracking fill:#f3e5f5
+    style Merge fill:#ef4444,stroke:#dc2626,stroke-width:2px,color:#fff
+    style Separate fill:#ef4444,stroke:#dc2626,stroke-width:2px,color:#fff
+    style Resolve fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Tracking fill:#8b5cf6,stroke:#7c3aed,stroke-width:2px,color:#fff
 ```
 
 **Data Structures:**
@@ -250,6 +255,7 @@ graph TD
 ## Shot Detection Pipeline
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TD
     Frame["Video Frame"]
     BallDet["Ball Detection<br/>HSV Color Masking<br/>Green + Purple"]
@@ -282,10 +288,10 @@ graph TD
     MadeOrMissed -->|Yes| Event
     MadeOrMissed -->|No| Event
     
-    style Event fill:#c8e6c9
-    style BallDet fill:#b2dfdb
-    style LaunchCheck fill:#fff59d
-    style MadeOrMissed fill:#fff59d
+    style Event fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style BallDet fill:#06b6d4,stroke:#0891b2,stroke-width:2px,color:#000
+    style LaunchCheck fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
+    style MadeOrMissed fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
 ```
 
 **Shot Launch Criteria:**
@@ -300,6 +306,7 @@ graph TD
 ## Output Formats
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph LR
     Tracking["Tracking Output<br/>RobotPose Array"]
     Shots["Shot Events<br/>ShotEvent Array"]
@@ -320,10 +327,10 @@ graph LR
     Shots --> WPILOG
     Tracking --> DEBUG
     
-    style CSV fill:#c8e6c9
-    style JLOG fill:#c8e6c9
-    style WPILOG fill:#c8e6c9
-    style DEBUG fill:#fff9c4
+    style CSV fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style JLOG fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style WPILOG fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style DEBUG fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
 ```
 
 ### CSV Structure (48 Columns)
@@ -373,6 +380,7 @@ graph LR
 ## Performance Characteristics
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TB
     Input["640×360 @ 30 fps<br/>5-minute match<br/>9000 frames"]
     
@@ -389,10 +397,10 @@ graph TB
     Pipeline --> Memory
     Time --> Bottleneck
     
-    style Input fill:#e1f5ff
-    style Bottleneck fill:#ffccbc
-    style Time fill:#c8e6c9
-    style Memory fill:#c8e6c9
+    style Input fill:#0ea5e9,stroke:#06b6d4,stroke-width:2px,color:#000
+    style Bottleneck fill:#ef4444,stroke:#dc2626,stroke-width:2px,color:#fff
+    style Time fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Memory fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
 ```
 
 ---
@@ -400,6 +408,7 @@ graph TB
 ## Error Handling & Recovery
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TD
     Issue["Issue Detected"]
     
@@ -419,13 +428,13 @@ graph TD
     RobotLost --> Resolve2
     MergeAmbig --> Resolve3
     
-    style Issue fill:#ffcdd2
-    style NoField fill:#ffccbc
-    style RobotLost fill:#ffccbc
-    style MergeAmbig fill:#ffccbc
-    style Resolve1 fill:#c8e6c9
-    style Resolve2 fill:#c8e6c9
-    style Resolve3 fill:#c8e6c9
+    style Issue fill:#dc2626,stroke:#991b1b,stroke-width:2px,color:#fff
+    style NoField fill:#ef4444,stroke:#dc2626,stroke-width:2px,color:#fff
+    style RobotLost fill:#ef4444,stroke:#dc2626,stroke-width:2px,color:#fff
+    style MergeAmbig fill:#ef4444,stroke:#dc2626,stroke-width:2px,color:#fff
+    style Resolve1 fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Resolve2 fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Resolve3 fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
 ```
 
 ---
@@ -433,6 +442,7 @@ graph TD
 ## Integration with FIRST Ecosystem
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TB
     AutoScout["AutoScout<br/>Tracking Pipeline"]
     
@@ -454,12 +464,12 @@ graph TB
     AutoScout --> CSV
     CSV --> Custom
     
-    style AutoScout fill:#ffd54f
-    style WPILog fill:#b3e5fc
-    style CSV fill:#c8e6c9
-    style AdvantageScope fill:#fff9c4
-    style FTCEvents fill:#d7ccc8
-    style Custom fill:#ffe0b2
+    style AutoScout fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
+    style WPILog fill:#0ea5e9,stroke:#06b6d4,stroke-width:2px,color:#000
+    style CSV fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style AdvantageScope fill:#ec4899,stroke:#be185d,stroke-width:2px,color:#fff
+    style FTCEvents fill:#6366f1,stroke:#4f46e5,stroke-width:2px,color:#fff
+    style Custom fill:#8b5cf6,stroke:#7c3aed,stroke-width:2px,color:#fff
 ```
 
 ---
@@ -547,6 +557,7 @@ python3 dashboard_server.py --host 127.0.0.1 --port 8765
 ## Testing & Validation
 
 ```mermaid
+%%{init: {theme: 'dark'}}%%
 graph TD
     Test["Test Workflow"]
     
@@ -560,9 +571,9 @@ graph TD
     Test --> Videos
     Test --> Checks
     
-    style Metrics fill:#c8e6c9
-    style Videos fill:#b3e5fc
-    style Checks fill:#fff9c4
+    style Metrics fill:#10b981,stroke:#059669,stroke-width:2px,color:#fff
+    style Videos fill:#0ea5e9,stroke:#06b6d4,stroke-width:2px,color:#000
+    style Checks fill:#f59e0b,stroke:#d97706,stroke-width:2px,color:#000
 ```
 
 ---
