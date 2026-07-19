@@ -1,3 +1,17 @@
+"""Data models for robot pose tracking and shot detection.
+
+This module defines the core dataclasses used throughout the AutoScout pipeline:
+- RobotPose: Robot position, orientation, and visibility in a single frame
+- MergeGroup: State management for multiple robots sharing a foreground blob
+- BallTrack: Ball trajectory and shot association
+- ShotEvent: Resolved shot result (made/missed)
+
+Coordinate Systems:
+- Internal (corner-origin): (0,0) to (144,144) inches, used by tracker
+- Public API (center-origin): (-72,-72) to (72,72) inches, used in outputs
+- WPILog: Swapped axes, meters, robotics heading convention
+"""
+
 import math
 from dataclasses import dataclass, field as dc_field
 from typing import List, Optional, Tuple
@@ -7,6 +21,28 @@ from autoscout.geometry import FIELD_CENTER_OFFSET_IN, _normalize_angle_rad
 
 @dataclass
 class RobotPose:
+    """Represents a robot's pose (position, orientation, visibility) at a single frame.
+    
+    Stores position in internal corner-origin coordinate system (0-144 inches).
+    Provides computed properties for conversion to center-origin, meters, and WPILog formats.
+    
+    Attributes:
+        x_in (float): Field X coordinate in inches (corner-origin, default=72)
+        y_in (float): Field Y coordinate in inches (corner-origin, default=72)
+        heading (float): Robot heading/rotation in radians (default=0.0)
+        visible (bool): Track visibility in current frame (default=False)
+    
+    Properties:
+        x_center_in, y_center_in: Center-origin field coordinates (subtract 72)
+        x_m, y_m: Meters (center-origin, multiply by 0.0254)
+        wpilog_x_m, wpilog_y_m: WPILog format (axes swapped, center-origin)
+        wpilog_heading_rad: WPILog heading (π/2 - heading, radians)
+    
+    Example:
+        >>> pose = RobotPose(x_in=100, y_in=80, heading=0.785, visible=True)
+        >>> pose.x_center_in  # 28.0 (100 - 72)
+        >>> pose.x_m          # 0.7112 (28 * 0.0254)
+    """
     x_in:    float = FIELD_CENTER_OFFSET_IN
     y_in:    float = FIELD_CENTER_OFFSET_IN
     heading: float = 0.0
@@ -81,6 +117,24 @@ class MergeGroup:
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ShotEvent:
+    """Represents a resolved shot event (made or missed goal attempt).
+    
+    Created when a ball track is finalized and either enters the goal region
+    or is lost without goal entry. Exported to CSV/JLOG output files.
+    
+    Attributes:
+        shooter_id (int): Robot ID (0-3) that launched the shot
+        result (str): Shot outcome - "made" or "missed"
+        shot_x_in (float): Ball X coordinate at launch (inches, center-origin)
+        shot_y_in (float): Ball Y coordinate at launch (inches, center-origin)
+        frame_num (int): Frame number when shot was launched
+        timestamp_s (float): Match time in seconds when shot was launched
+        goal_color (str): Target goal color - "blue" or "red" (default="")
+    
+    Note:
+        Deduplication: Events from same robot within 0.35s are suppressed
+        to avoid duplicate detection of bounces/rebounds.
+    """
     shooter_id: int
     result: str
     shot_x_in: float
@@ -92,6 +146,41 @@ class ShotEvent:
 
 @dataclass
 class BallTrack:
+    """Tracks a ball's trajectory and associates it with shot events.
+    
+    Maintains centroid history, handles temporary occlusions (missing frames),
+    detects launch velocity/angle, associates with shooter robot, and tracks
+    goal entry/exit. Finalized when ball is missing too long or goal entry
+    is confirmed.
+    
+    Attributes:
+        track_id (int): Unique identifier for this ball track
+        samples (List[(frame, x, y)]): Ball centroid positions over time (pixel space)
+        missing_frames (int): Consecutive frames without detection
+        launched (bool): Has this shot been launched (velocity threshold met)?
+        shooter_id (Optional[int]): Robot ID (0-3) if launched, else None
+        shooter_img (Optional[(px, py)]): Robot image position at launch
+        shooter_dist_px (Optional[float]): Distance from shooter at launch (pixels)
+        shooter_pos_center_in (Optional[(x, y)]): Shooter field position at launch
+        goal_color (str): "blue" or "red" for target goal
+        entered_goal (bool): Did ball enter goal region?
+        entered_goal_frames (int): Consecutive frames inside goal
+        first_goal_entry_frame (Optional[int]): Frame number of first entry
+        last_goal_entry_point (Optional[(px, py)]): Last position in goal (pixels)
+        approached_goal (bool): Did ball approach goal region?
+        resolved (bool): Has this track been finalized?
+    
+    Properties:
+        last_point: Most recent sample (frame, x, y) or None
+        first_point: Oldest sample (frame, x, y) or None
+    
+    Lifecycle:
+        1. Created on ball detection (unassociated)
+        2. Associated to track via nearest-neighbor search
+        3. Marked as launched when velocity thresholds met
+        4. Goal entry tracked as ball approaches/enters goal region
+        5. Resolved when missing >12 frames or match ends
+    """
     track_id: int
     samples: List[Tuple[int, float, float]] = dc_field(default_factory=list)
     missing_frames: int = 0

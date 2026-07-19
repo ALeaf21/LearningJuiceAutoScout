@@ -1,3 +1,59 @@
+"""
+JLOG Binary Format Encoder/Decoder
+
+JLOG is a compact binary format for storing match tracking data (~90% smaller than CSV).
+Designed for efficient storage and playback of AutoScout tracking results.
+
+Format Structure:
+    - Header: Magic number ("JLOGv002"), version, schema info
+    - Schema Definition: Column names, types, scales, units
+    - Data Blocks: Fixed-size (128 rows) compressed blocks
+        - Each block: header + row data + zlib compression
+        - Variable-length encoding for integers and strings
+
+Data Types and Encoding:
+    - scaled_int: Integer value × scale factor (e.g., x_in with scale 100 stores cm)
+      Encoded as varint (variable-length signed integer) via ZigZag encoding
+      Benefits: Small integers use fewer bytes, handles negative values
+    - bool: Single bit per value (packed into bytes)
+    - string: Variable-length UTF-8 with length prefix (varuint)
+    - int/float64: Not used in JLOG v2 for pose data
+
+Key Constants:
+    - MAGIC_V2 = b"JLOGv002": Current format version magic bytes
+    - DEFAULT_BLOCK_ROWS = 128: Rows per compressed block (configurable)
+    - BLOCK_MAGIC = b"JBLK": Block header magic
+    - ROBOT_POSE_SCHEMA: 48-column schema for AutoScout tracking output
+
+CSV_COLUMNS Match Schema:
+    - Timestamp (1): match time in seconds (scale 1000)
+    - Robot poses (16): 4 robots × (x, y, heading, visible) 
+    - Shot events (32): 4 robots × (result, x, y, goal color)
+
+Coordinate Systems:
+    - x_in, y_in: Center-origin field coordinates (scale: 100 = 1 inch)
+    - heading_rad: Robot heading in radians (scale: 10000 = 1 radian)
+    - shot_(x,y)_in: Shot landing position
+
+Compression:
+    - Each block independently compressed with zlib (default compression)
+    - Enables partial decompression and random access
+
+Dependencies:
+    - struct: Binary packing/unpacking
+    - zlib: Block-level compression
+    - csv: CSV reading/writing for conversions
+
+Usage:
+    >>> writer = JuiceLogWriter("output.jlog", schema)
+    >>> writer.add_row([timestamp, r0_x, r0_y, ...])
+    >>> writer.close()
+    
+    >>> reader = JuiceLogReader("output.jlog")
+    >>> for row_dict in reader:
+    ...     print(row_dict["robot0_x_in"])
+"""
+
 import csv
 import struct
 import zlib

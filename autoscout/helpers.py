@@ -1,3 +1,43 @@
+"""
+Helper Utilities for Field Calibration and Re-ID Bootstrapping
+
+Provides tools for:
+1. Automatic field corner detection from video frames
+2. Manual re-ID histogram extraction from hand-labeled reference data
+3. Debug visualization (wire cube overlays, video output)
+
+Field Detection (FieldDetector):
+    - Canny edge detection on grayscale frame
+    - Contour extraction and polygon fitting
+    - Orders corners as [top-left, top-right, bottom-right, bottom-left]
+    - Validates via homography quality check
+    - Used for auto-calibration if --corners not provided
+
+Manual Re-ID Bootstrapping:
+    - Reads hand-labeled CSV with robot positions at key frames
+    - Extracts HSV appearance histograms from each robot at each frame
+    - Stores histograms for each robot for appearance-based re-identification
+    - Useful when auto-tracking fails on unusual robot colors/patterns
+    - Process:
+        1. Generate manual_poses.csv with timestamp, robot_(x,y), visible columns
+        2. Run: python auto_scout.py ... --manual-reference-csv manual_poses.csv
+        3. Tracker uses stored histograms for better re-ID matching
+
+Debug Visualization:
+    - _draw_wire_cube: Projects 3D robot model onto frame
+    - _open_debug_video_writer: Multi-codec fallback (MP4V, MJPEG, XVID)
+
+Coordinate System Conversions:
+    - _project_field_points: Field coords → image pixel coords (via H_inv)
+    - _project_image_points: Image pixel coords → field coords (via H_2d)
+
+Dependencies:
+    - OpenCV (cv2): Edge detection, polygon fitting, transforms
+    - NumPy (np): Array operations, polygon math
+    - CSV module: Reading manual reference files
+    - geometry.py: Coordinate conversions (_field_center_to_corner_xy)
+"""
+
 import csv
 import math
 import os
@@ -8,12 +48,57 @@ from util.juice_log import sniff_jlog
 
 
 class FieldDetector:
-    def __init__(self, cv2, np):
-        self.cv2, self.np = cv2, np
+    """
+    Automatic field corner detection via edge detection and polygon fitting.
+    
+    Uses Canny edge detection to find the field boundary in a frame, then extracts
+    the largest 4-vertex polygon as the field corners. Validates corners via
+    homography computation.
+    
+    Example:
+        >>> detector = FieldDetector(cv2, np)
+        >>> corners, H = detector.detect_field(frame)
+        >>> # corners = (tl, tr, br, bl) in pixel coordinates
+        >>> # H = homography matrix for perspective transform
+    """
 
     def detect_field(self, frame):
-        cv2, np = self.cv2, self.np
-        h, w = frame.shape[:2]
+        """
+        Automatically detect field corners from a video frame.
+        
+        Detection Pipeline:
+            1. Convert frame to grayscale
+            2. Apply Gaussian blur (5×5 kernel)
+            3. Canny edge detection (thresholds: 30-100)
+            4. Find contours from edges
+            5. For each contour (sorted by area, descending):
+                - Filter by minimum area (5% of frame)
+                - Approximate to 4-vertex polygon
+                - Order vertices: top-left, top-right, bottom-right, bottom-left
+                - Compute homography to validate
+                - Return first valid detection
+        
+        Vertex Ordering:
+            - sum(coords): smallest = top-left, largest = bottom-right
+            - diff(x,y): most negative = top-right, most positive = bottom-left
+            - Ensures consistent corner ordering for homography
+        
+        Args:
+            frame (np.ndarray): BGR video frame (h, w, 3)
+        
+        Returns:
+            Tuple or None: If detected:
+                - (ordered_corners, H) where:
+                  - ordered_corners: 4×2 array [(tl), (tr), (br), (bl)] in pixels
+                  - H: 3×3 homography matrix for field → pixel transform
+            Returns None if no valid 4-vertex polygon detected
+        
+        Notes:
+            - Searches only top 10 largest contours (efficiency)
+            - Minimum area threshold: 5% of frame dimensions
+            - Requires clean edge-defined field boundary
+            - May fail on complex backgrounds or poor lighting
+        """
         edges = cv2.Canny(
             cv2.GaussianBlur(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (5,5), 0),
             30, 100)
@@ -68,7 +153,59 @@ def _build_manual_reid_histograms(
     H_inv,
     video_fps: float,
 ):
-    cv2, np = tracker.cv2, tracker.np
+    """
+    Bootstrap re-ID (appearance-based robot identification) from hand-labeled data.
+    
+    Reads a CSV with manual robot positions at key frames, then extracts HSV color
+    histograms from those positions. These histograms are stored as per-robot reference
+    models for appearance-based track matching during collisions.
+    
+    Input CSV Format (minimal):
+        timestamp_s,robot0_x_in,robot0_y_in,...,robot0_visible,...
+        0.0,72.0,36.0,...,1,...
+        0.5,70.0,38.0,...,1,...
+        (one row per timestamp; roboti_visible=1 means robot i is visible at that time)
+    
+    Processing:
+        1. Read manual_reference_csv (CSV or JLOG format)
+        2. For each row with stride=REID_SAMPLE_STRIDE:
+            - Seek to corresponding video frame
+            - For each visible robot:
+              - Transform field position to image pixels (via H_inv)
+              - Extract HSV histogram from 64×64 crop around robot
+              - Store in refs[robot_id] list (up to REID_MAX_SAMPLES_PER_ROBOT)
+        3. Return dict {robot_id: [histogram1, histogram2, ...]}
+    
+    Histogram Extraction:
+        - Crops 64×64 window (REID_CROP_SCALE * robot_max_px)
+        - Computes HSV histogram (18 Hue bins × 16 Saturation bins)
+        - Ignores low-saturation pixels (removes field/background)
+    
+    Args:
+        tracker (RobotTracker): Tracker with _extract_appearance_feature method
+        cap (cv2.VideoCapture): Video file handle (seekable)
+        manual_reference_csv (str): Path to hand-labeled positions
+            Can be CSV or JLOG format (auto-detected)
+        H_inv (np.ndarray): Inverse homography (field → pixel)
+        video_fps (float): Video frame rate
+    
+    Returns:
+        Dict[int, List] or None:
+            - Key: robot_id (0-3)
+            - Value: List of HSV histograms (OpenCV Hist objects)
+            - None if no histograms could be extracted
+    
+    Side Effects:
+        - Seeks video file to extract frames
+        - Resets cap to frame 0 at completion
+        - Prints sample counts and warnings to console
+    
+    Notes:
+        - Sampling stride: REID_SAMPLE_STRIDE (default 15) for efficiency
+        - Max samples per robot: REID_MAX_SAMPLES_PER_ROBOT (default 48)
+        - Stops early if 48 samples collected for all 4 robots
+        - Warnings if CSV is empty or histograms couldn't be extracted
+    """
     rows = _load_manual_pose_rows(manual_reference_csv)
     if not rows:
         print("[WARN] Manual re-ID reference file is empty: {}".format(manual_reference_csv))

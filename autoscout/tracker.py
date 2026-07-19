@@ -1,3 +1,43 @@
+"""
+Robot Tracking Engine for FTC Match Videos
+
+This module implements the core tracking pipeline for automatically tracking 4 FTC robots
+in match videos using background subtraction, blob detection, and optimal assignment.
+
+Key Concepts:
+    - Background Subtraction: Median-based foreground mask (|frame - median_bg| > FG_THRESH)
+    - Blob Detection: Morphological operations + contour extraction with re-ID histogram features
+    - Hungarian Assignment: Cost-matrix optimization to assign detected blobs to tracked robots
+    - Merge Group Management: Handle 2+ robot collisions with permutation voting (v3.2)
+    - Post-Merge Locks: Prevent re-ID noise immediately after merge separation
+
+Coordinate Systems:
+    - Internal (corner-origin): (0,0) to (144,144) inches - used for homography transforms
+    - Tracks stored in field coordinates (center-origin by models.py conversion)
+
+Main Workflow (per frame):
+    1. Extract foreground blobs via background subtraction + morphological ops
+    2. If not initialized: bootstrap select 4 valid blobs with ~4x min_spacing
+    3. If initialized: assign blobs to tracks via Hungarian algorithm (cost matrix)
+    4. Manage merge groups: detect when 2+ tracks overlap in same blob
+    5. Update robot poses, velocities, and headings
+    6. Emit RobotPose array to output pipeline
+
+Configuration Constants:
+    - FG_THRESH (30): Foreground detection threshold, raised to reduce crowd noise
+    - BLOB_MIN (350): Minimum blob area in pixels², filters noise
+    - MAX_COAST (60): Frames a track survives without blob detection
+    - REID_COST_WEIGHT (1.60): Appearance-based re-ID histogram cost multiplier
+    - POST_MERGE_LOCK_FRAMES (12): Frames to lock track assignment after merge separation
+    - MERGE_HOLD (16): Frames to suppress new merges after recent merge for same pair
+
+Dependencies:
+    - models.py: RobotPose, MergeGroup dataclasses
+    - runtime.py: _make_bar() for progress bars
+    - OpenCV (cv2): Morphology, perspective transforms, contour detection
+    - NumPy (np): Array operations, Hungarian algorithm prep
+"""
+
 import itertools
 import math
 from collections import defaultdict
@@ -8,6 +48,38 @@ from autoscout.runtime import _make_bar
 
 
 class RobotTracker:
+    """
+    Main robot tracking engine using background subtraction + Hungarian assignment.
+    
+    This class manages the complete lifecycle of robot tracking through a video:
+    - Bootstrap initialization (selecting 4-robot lineup from first frames)
+    - Per-frame blob detection and track assignment
+    - Merge group handling for colliding robots (2-way, 3-way, 4-way)
+    - Motion prediction and velocity estimation
+    - Re-identification via HSV histogram matching
+    
+    Attributes:
+        tracked_poses (List[RobotPose]): Current poses for 4 robots [r0, r1, r2, r3]
+        _bg (np.ndarray): Median background image (h, w, 3) computed from video samples
+        _H_2d (np.ndarray): 3×3 homography matrix for pixel ↔ field coordinate transform
+        _H_inv (np.ndarray): Inverse homography for field → pixel transform
+        _merge_groups (Dict): Active merge groups keyed by frozenset(track_ids)
+        _coast (List[int]): Frames since last detection for each track (for coasting)
+        _pos, _vel: Position and velocity for each track (field and image space)
+        _reid_refs (Optional[Dict]): Manual re-ID histograms from CSV (if provided)
+    
+    Lifecycle:
+        1. __init__(cv2, np): Create tracker with CV2/NumPy handles
+        2. setup(video_path, corners, frame_shape): Initialize background, homography
+        3. update(frame) → RobotPose[]: Per-frame tracking loop (called for each frame)
+    
+    Example:
+        >>> tracker = RobotTracker(cv2, np)
+        >>> tracker.setup("match.mp4", [(tl), (tr), (br), (bl)], (360, 640, 3))
+        >>> for frame in video_frames:
+        ...     poses = tracker.update(frame)
+        ...     print(f"Robot 0: ({poses[0].x_in:.1f}, {poses[0].y_in:.1f})")
+    """
     N_BG_SAMPLES  = 80
     FG_THRESH     = 30       # Raised from 22: reduces noise from crowd/alliance members
     BLOB_MIN      = 350      # Raised from 260: skip tiny noise blobs
@@ -58,7 +130,27 @@ class RobotTracker:
     POST_MERGE_DUPLICATE_IN = 12.0
 
     def __init__(self, cv2, np):
-        self.cv2, self.np = cv2, np
+        """
+        Initialize RobotTracker with OpenCV and NumPy handles.
+        
+        Sets up all tracking state variables, creates morphological kernels, and initializes
+        data structures for tracking. Note: homography/background are set in setup().
+        
+        Args:
+            cv2 (module): OpenCV library handle (e.g., cv2 from 'import cv2')
+            np (module): NumPy library handle (e.g., numpy as np)
+        
+        Initializes:
+            - Tracking state: tracked_poses, position, velocity, coast counters
+            - Morphological kernels: ELLIPSE kernel (7×7), neck-breaking kernel (set in setup)
+            - Merge group management: _merge_groups, _underresolved_tracks, _post_merge_locks
+            - Re-ID features: _reid_refs (loaded from CSV if provided), per-track histograms
+            - Static blob suppression: _blob_static_counts for persistent foreground filtering
+            - Corner zone exclusion: CORNER_ZONE_IN for filtering structure artifacts
+        
+        Note: The homography matrix (_H_2d) and background image (_bg) are None until setup()
+        is called. Initial coast values are 999 to mark "never detected" state.
+        """
         self._bg           = None
         self._field_mask   = None
         self._H_2d         = None
@@ -102,8 +194,35 @@ class RobotTracker:
     # ── setup ────────────────────────────────────────────────────────────
 
     def setup(self, video_path, ordered_corners, frame_shape):
-        cv2, np = self.cv2, self.np
-        h, w = frame_shape[:2]
+        """
+        Initialize tracker with field geometry, background model, and homography.
+        
+        Performs three critical setup steps:
+        1. Computes perspective homography: pixel ↔ field coordinate transforms
+           - Samples 80 frames from video to build median background image
+           - Converts FTC field corners (pixel) to corner-origin field coords (0-144 inches)
+        2. Calibrates pixel-to-inch scale by transforming known field distances
+           - Sets _robot_max_px for blob size validation during tracking
+           - Creates neck-breaking kernel for separating overlapping robots
+        3. Creates field mask polygon for restricting foreground to playing field
+        
+        Args:
+            video_path (str): Path to video file (used to extract background samples)
+            ordered_corners (List[Tuple[int,int]]): Pixel coordinates of field corners
+                [top_left, top_right, bottom_right, bottom_left] in video frame
+            frame_shape (Tuple[int,int,int]): Frame dimensions (height, width, channels)
+        
+        Sets:
+            - _H_2d: Homography matrix for perspective transform (field → pixel)
+            - _H_inv: Inverse homography (pixel → field)
+            - _bg: Median background image for foreground subtraction
+            - _field_mask: Binary mask of valid play area (0-255)
+            - _robot_max_px: Maximum robot size in pixels (for blob validation)
+            - _neck_kern: Morphological kernel for separating robot "necks" during merge
+        
+        Note: Field coordinates use corner-origin system (0,0) at top-left, (144,144) at bottom-right
+        inch values. The ordered_corners parameter must be in clockwise order starting from top-left.
+        """
 
         tl, tr, br, bl = ordered_corners
         cx_poly = (tl[0]+tr[0]+br[0]+bl[0]) / 4
@@ -163,10 +282,56 @@ class RobotTracker:
     # ── main update ───────────────────────────────────────────────────────
 
     def update(self, frame, _H=None):
-        if self._bg is None or self._H_2d is None:
-            for p in self.tracked_poses:
-                p.visible = False
-            return self.tracked_poses
+        """
+        Perform one frame of robot tracking.
+        
+        Main per-frame processing loop that:
+        1. Extracts foreground blobs via background subtraction + morphological ops
+        2. If not yet initialized: bootstrap select 4 valid blobs as initial track lineup
+        3. If initialized: assign blobs to tracks via Hungarian algorithm (cost minimization)
+        4. Manage merge groups: detect/update/resolve 2+ robot collisions
+        5. Update robot poses, velocities, headings, and visibility flags
+        6. Apply post-merge locks to prevent re-ID noise after separation
+        
+        Blob Detection Pipeline:
+            - Foreground mask: |frame - _bg| > FG_THRESH (30) on each channel
+            - Morphological operations: opening (noise removal) + closing (hole filling)
+            - Contour extraction: filter by area (BLOB_MIN=350 px²) and circularity
+            - Remove blobs in corner structures or marked as static
+            - Extract HSV histogram features for appearance-based re-ID
+        
+        Assignment Strategy:
+            - Cost matrix: (motion + quality + appearance + penalties) for each (track, blob) pair
+            - Hungarian algorithm minimizes total cost subject to: each track ≤ 1 blob, blob ≤ 1 track
+            - Costs include: motion prediction error, re-ID histogram distance, post-merge penalties
+        
+        Merge Group Management:
+            - 2-way merges: Freeze positions for both tracks (let motion predict)
+            - 3+ way merges: Use distance transform peaks to assign track positions within blob
+            - Permutation voting: Resolve which track identity goes where during separation
+            - Post-merge locks: Prevent immediate re-assignment for POST_MERGE_LOCK_FRAMES (12)
+        
+        Args:
+            frame (np.ndarray): BGR frame image (h, w, 3) from video
+            _H (optional): Unused parameter (for future use)
+        
+        Returns:
+            List[RobotPose]: Updated poses for 4 robots [r0, r1, r2, r3]
+                Each RobotPose contains: x_in, y_in, heading (radians), visible (bool)
+                Uses center-origin coordinates (-72 to 72 inches)
+        
+        Side Effects:
+            - Updates tracked_poses[0-3]: Current robot positions and visibility
+            - Updates internal state: _coast (detection timeout), _merge_groups, _post_merge_locks
+            - Updates velocities: _vel (field), _vel_px (image) for motion prediction
+            - Updates track features: _track_features for re-ID histogram tracking
+        
+        Implementation Notes:
+            - Blobs are tuples: (fx, fy, heading, pid, cx, cy, quality, nsplit, contour, feature, ...)
+            - Positions stored in both field space (fx, fy) and image space (cx, cy) for velocity calc
+            - Coast counter (VISIBLE_COAST=8 frames): tracks show as visible even while coasting
+            - Multi-merge peaks extracted via distance transform for precise position assignment
+        """
 
         for i in range(4):
             if self._merge_recent[i] > 0:
@@ -429,8 +594,63 @@ class RobotTracker:
     # ── optimal assignment ────────────────────────────────────────────────
 
     def _assign(self, blobs: list) -> Dict[int, int]:
-        np = self.np
-        n = len(blobs)
+        """
+        Assign detected blobs to robot tracks using optimal cost-matrix assignment.
+        
+        Implements Hungarian algorithm (via SciPy or greedy fallback) to minimize total cost
+        across all track-blob pairs. This is the core matching engine that solves the bipartite
+        matching problem: each track can be assigned to at most one blob, and vice versa.
+        
+        Cost Matrix Construction (4 tracks × N+4 blobs):
+            - Rows: 4 robot tracks [0, 1, 2, 3]
+            - Columns: N detected blobs + 4 skip columns (for unmatched tracks)
+            - Cost per pair: motion_error + image_error + quality + appearance + post_merge_penalties
+        
+        Cost Components for Each (Track, Blob) Pair:
+            1. dist_cost: Field-space distance from predicted position
+               - Scaled by MAX_DIST_IN (30 in) for recently visible tracks
+               - Scaled by MAX_REACQ_IN (144 in) for coasted tracks (MAX_COAST exceeded)
+            2. img_cost: Image-space pixel distance from predicted position
+               - Scaled by robot_max_px (calibrated during setup)
+               - Weight: 0.35× to reduce image noise influence
+            3. qual_cost: Blob quality penalty for small or split blobs
+            4. appearance_cost: HSV histogram re-ID distance (Bhattacharyya)
+               - Weight: 1.60× for normal tracking
+               - Weight: 2.70× for reacquisition (after MAX_COAST frames coasting)
+            5. post_merge_lock_penalties: After merge separation, bias toward recent match
+               - Lock image distance penalty (normalized by robot_max_px)
+               - Lock appearance cost (feature comparison)
+        
+        Plausibility Gating:
+            - Hard rejection if dist > dist_scale (reacquisition distance)
+            - Hard rejection if image distance exceeds robot footprint bounds
+            - Hard rejection for weak single-split blobs during certain states
+            - Post-merge lock rejects if image distance > POST_MERGE_LOCK_REJECT_PX (115 px)
+        
+        Skip Columns (Unmatched Tracks):
+            - Allow tracks to skip matching when all blob options are poor
+            - Skip cost varies: 0.9 (never detected) → 2.0+ (coasted too long)
+            - Post-merge lock adds 0.6 to skip cost (prefer lock match if available)
+            - Recent merge adds bias to prevent re-assignment for MERGE_HOLD frames
+        
+        Solver:
+            - Primary: SciPy linear_sum_assignment (O(n³) Hungarian algorithm)
+            - Fallback: Greedy minimum-cost matching if SciPy not available
+        
+        Args:
+            blobs (List[Tuple]): Detected blobs with format:
+                (fx, fy, heading, pid, cx, cy, quality, nsplit, contour, feature, ...)
+                where fx,fy = field coords, cx,cy = image coords
+        
+        Returns:
+            Dict[int, int]: Mapping {track_id → blob_index} for successful assignments
+                Only includes tracks that matched a blob; skipped tracks not in dict
+        
+        Side Effects:
+            - No state modification (pure assignment computation)
+            - Reads: _pos, _coast, _merge_groups, _post_merge_locks, _reid_refs
+            - Reads: _underresolved_tracks (for merge gating)
+        """
 
         INF       = 1e9
         SKIP_COST = 2.0
@@ -606,8 +826,47 @@ class RobotTracker:
 
     def _create_merge_group(self, track_ids: List[int], parent_id: int) -> MergeGroup:
         """
-        Create a MergeGroup.  For 3+ tracks, record entry_order so we can
-        detect permutations during the merge (fix f).
+        Initialize a MergeGroup for 2+ tracks sharing a single foreground blob.
+        
+        Computes the principal axis (direction of maximum spread) of tracks at merge time.
+        For 3+ robot merges, initializes voting system to resolve permutations. For 2-robot
+        merges, prepares for side-swap detection via entry_axis crossing.
+        
+        Entry Axis Computation:
+            - Finds farthest pair of track positions (at merge start)
+            - Sets entry_axis as unit vector pointing from low→high position
+            - Used to project track positions along merge direction
+            - Basis for detecting if robots have swapped sides during merge
+        
+        Entry Order (3+ Merges Only):
+            - Tracks sorted by projection onto entry_axis at merge start
+            - entry_order[0] is "low" end, entry_order[-1] is "high" end
+            - Immutable throughout merge; basis for permutation voting
+            - If current_order ≠ entry_order at separation, permutation occurred
+        
+        Voting System Initialization:
+            - order_votes[track_id] = [count_slot0, count_slot1, ...]
+            - Each frame, current_order updates and votes are recorded
+            - At separation, best permutation = highest vote total
+            - Handles ambiguous separations via voting consensus
+        
+        Peak Assignment:
+            - Initialized with entry positions (guards against stale peaks)
+            - Updated each frame from distance transform peaks during merge
+            - Used for live position updates and separation re-anchoring
+        
+        Args:
+            track_ids (List[int]): Tracks involved in merge (should have 2+ entries)
+            parent_id (int): Contour ID of the merged blob (for reference)
+        
+        Returns:
+            MergeGroup: Initialized merge state with:
+                - track_ids, entry_axis, parent_id
+                - crossed = False (for 2-way), entry_order, current_order, peak_assignment
+                - order_votes, entry_features (for re-ID stability)
+        
+        Note: Uses field positions (_pos) if available, falls back to image coordinates (_pos_px)
+        transformed via _H_inv homography.
         """
         np = self.np
         positions = []
@@ -671,11 +930,48 @@ class RobotTracker:
 
     def _update_crossing(self, mg: MergeGroup, contour) -> None:
         """
-        Update per-frame merge state.
-
-        2-robot merges: unchanged from v3.1 (crossed flag).
-        3+ robot merges: update peak_assignment AND current_order so we can
-        detect the full permutation at separation (fixes e, f, g).
+        Update merge group state for current frame.
+        
+        Per-frame processing of active merge:
+        1. For 2-robot merges: detect side-swap via entry_axis crossing
+        2. For 3+ robot merges: extract distance transform peaks, assign to tracks,
+           update current_order, and record permutation votes
+        
+        Two-Robot Merge (2-way):
+            - Compute entry_axis at merge start
+            - Extract blob peak positions
+            - Project onto entry_axis to detect if robots have "crossed"
+            - Set mg.crossed = True if side swap detected
+            - Used to swap track state on separation
+        
+        3+ Robot Merge (Multi-way):
+            - Extract distance transform peaks from merged blob contour
+            - Assign peaks to tracks via nearest-neighbor search
+            - Update peak_assignment: {track_id: (px, py)} with new peak positions
+            - Sort tracks by peak projections → current_order
+            - Record vote: current_order is valid assignment for this frame
+            - Provides live position updates during merge (fix e)
+        
+        Peak Assignment Strategy:
+            - Uses distance transform to identify blob sub-regions (robot locations)
+            - Assigns peaks nearest to track's previous position (continuity)
+            - Handles missing peaks: preserve last good state (fix g)
+            - Tolerance: robot_max_px * 0.75 for re-assignment
+        
+        Args:
+            mg (MergeGroup): Active merge group to update
+            contour (np.ndarray): Contour points of merged blob (for distance transform)
+        
+        Side Effects:
+            - Updates mg.crossed for 2-robot merges (for separation handling)
+            - Updates mg.peak_assignment for 3+ merges (live positions)
+            - Updates mg.current_order (track order along axis)
+            - Updates mg.order_votes (voting for permutation resolution)
+        
+        Notes:
+            - For full overlaps (< 2 peaks), preserves existing peak_assignment
+            - Projections are computed relative to blob centroid
+            - _record_merge_order weights votes based on peak assignment success rate
         """
         cv2 = self.cv2
         peaks = self._split_contour(contour)
